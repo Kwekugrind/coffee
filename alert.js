@@ -213,23 +213,52 @@ Waiting for M30 fractal break confirmation...`
     if (fractalBreak && state.lastConfirmCandle !== candleTime) {
 
       let entry = closePrice;
-      let structureStop, atrStop, finalStop, risk, tp;
+let finalStop, risk, tp;
 
-      if (fractalBreak === "BUY") {
+// ✅ BUY logic
+if (fractalBreak === "BUY") {
 
-    // ✅ Stop slightly below SMA34
-    finalStop = sma34[last] - (atr * 0.7);
+  let recentLow = Math.min(
+    m15[last].low,
+    m15[last - 1].low,
+    m15[last - 2].low
+  );
 
-    risk = entry - finalStop;
-    tp = entry + (risk * RISK_REWARD);
+  let structureStop = recentLow - (atr * 0.2);
 
-} else {
+  let maxStopDistance = atr * 1.0;
 
-    // ✅ Stop slightly above SMA34
-    finalStop = sma34[last] + (atr * 0.7);
+  if (entry - structureStop > maxStopDistance) {
+    finalStop = entry - maxStopDistance;
+  } else {
+    finalStop = structureStop;
+  }
 
-    risk = finalStop - entry;
-    tp = entry - (risk * RISK_REWARD);
+  risk = entry - finalStop;
+  tp = entry + (risk * RISK_REWARD);
+}
+
+// ✅ SELL logic
+else {
+
+  let recentHigh = Math.max(
+    m15[last].high,
+    m15[last - 1].high,
+    m15[last - 2].high
+  );
+
+  let structureStop = recentHigh + (atr * 0.2);
+
+  let maxStopDistance = atr * 1.0;
+
+  if (structureStop - entry > maxStopDistance) {
+    finalStop = entry + maxStopDistance;
+  } else {
+    finalStop = structureStop;
+  }
+
+  risk = finalStop - entry;
+  tp = entry - (risk * RISK_REWARD);
 }
 
       await sendTelegram(
