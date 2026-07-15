@@ -1,5 +1,5 @@
 {
-  "trend": null,
-  "lastSignalCandle": null,
-  "lastFractalBreakCandle": null
+  "activeDirection": null,
+  "lastCrossCandle": null,
+  "lastConfirmCandle": null
 }
