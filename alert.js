@@ -167,7 +167,8 @@ function fractals(highs, lows) {
     const sma34 = sma(closes, 34);
     const atr = calculateATR(m15, ATR_PERIOD);
 
-    const last = closes.length - 1;
+    // ✅ Use last fully CLOSED candle (never forming candle)
+    const last = closes.length - 2;
     const prev = last - 1;
 
     const candleTime = m15[last].epoch;
