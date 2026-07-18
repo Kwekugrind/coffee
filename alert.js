@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import fetch from "node-fetch";
 import fs from "fs";
 
-const SYMBOL = "STPUSD";   // ✅ Step Index
+const SYMBOL = "STEP_INDEX";   // ✅ Step Index
 const SYMBOL_NAME = "📊 Step Index";
 
 const M15 = 900;
