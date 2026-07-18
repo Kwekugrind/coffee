@@ -244,9 +244,34 @@ TP: ${tp.toFixed(3)}
 RR: 1 : ${RISK_REWARD}
 
 Time: ${isoTime}`
-      );
+);
 
-      state.activeDirection = null;
+// ✅ OMNISIGHT TRADE LOGGING
+let trades = [];
+
+if (fs.existsSync("trades.json")) {
+  trades = JSON.parse(fs.readFileSync("trades.json"));
+}
+
+const trade = {
+  repo: "Coffee Machine",
+  symbol: SYMBOL,
+  direction: fractalBreak,
+  entry: entry,
+  stop: finalStop,
+  tp: tp,
+  rr: RISK_REWARD,
+  openTime: isoTime,
+  closeTime: null,
+  result: null
+};
+
+trades.push(trade);
+
+fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+
+// ✅ existing reset logic
+state.activeDirection = null;
       state.lastConfirmCandle = candleTime;
     }
 
