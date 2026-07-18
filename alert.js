@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import fetch from "node-fetch";
 import fs from "fs";
 
-const SYMBOL = "STP";   // ✅ Step Index
+const SYMBOL = "STEP";   // ✅ Step Index
 const SYMBOL_NAME = "📊 Step Index";
 
 const M15 = 900;
@@ -56,7 +56,7 @@ async function getCandles(granularity, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const candles = await new Promise((resolve, reject) => {
-        const ws = new WebSocket("wss://ws.binaryws.com/websockets/v3?app_id=1089");
+        const ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
 
         const timeout = setTimeout(() => {
           ws.terminate();
@@ -65,13 +65,11 @@ async function getCandles(granularity, retries = 3) {
 
         ws.on("open", () => {
           ws.send(JSON.stringify({
-            ticks_history: SYMBOL,
-            adjust_start_time: 1,
+            candles: SYMBOL,
             count: CANDLES,
             granularity,
-            end: "latest",
-            style: "candles"
-          }));
+            end: "latest"
+        }));
         });
 
         ws.on("message", (data) => {
