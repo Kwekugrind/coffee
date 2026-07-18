@@ -2,8 +2,8 @@ import WebSocket from "ws";
 import fetch from "node-fetch";
 import fs from "fs";
 
-const SYMBOL = "1HZ25V";
-const SYMBOL_NAME = "📊 V25 (1s) — 1HZ25V";
+const SYMBOL = "STEP";   // ✅ Step Index
+const SYMBOL_NAME = "📊 Step Index";
 
 const M15 = 900;
 const M30 = 1800;
