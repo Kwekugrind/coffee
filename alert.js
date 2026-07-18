@@ -65,12 +65,13 @@ async function getCandles(granularity, retries = 3) {
 
         ws.on("open", () => {
           ws.send(JSON.stringify({
-            candles: SYMBOL,
-            count: CANDLES,
-            granularity,
-            end: "latest"
+           ticks_history: SYMBOL,
+           count: CANDLES,
+           granularity,
+           end: "latest",
+          style: "candles"
         }));
-        });
+      });
 
         ws.on("message", (data) => {
           const response = JSON.parse(data);
