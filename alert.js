@@ -135,17 +135,17 @@ function fractals(highs, lows) {
   let up = [], down = [];
   for (let i = 2; i < highs.length - 2; i++) {
     if (
-      highs[i] > highs[i-1] &&
-      highs[i] > highs[i-2] &&
-      highs[i] > highs[i+1] &&
-      highs[i] > highs[i+2]
+      highs[i] > highs[i - 1] &&
+      highs[i] > highs[i - 2] &&
+      highs[i] > highs[i + 1] &&
+      highs[i] > highs[i + 2]
     ) up[i] = highs[i];
 
     if (
-      lows[i] < lows[i-1] &&
-      lows[i] < lows[i-2] &&
-      lows[i] < lows[i+1] &&
-      lows[i] < lows[i+2]
+      lows[i] < lows[i - 1] &&
+      lows[i] < lows[i - 2] &&
+      lows[i] < lows[i + 1] &&
+      lows[i] < lows[i + 2]
     ) down[i] = lows[i];
   }
   return { up, down };
@@ -167,7 +167,6 @@ function fractals(highs, lows) {
     const sma34 = sma(closes, 34);
     const atr = calculateATR(m15, ATR_PERIOD);
 
-    // ✅ Use last fully CLOSED candle (never forming candle)
     const last = closes.length - 2;
     const prev = last - 1;
 
@@ -244,34 +243,33 @@ TP: ${tp.toFixed(3)}
 RR: 1 : ${RISK_REWARD}
 
 Time: ${isoTime}`
-);
+      );
 
-// ✅ OMNISIGHT TRADE LOGGING
-let trades = [];
+      // ✅ OMNISIGHT TRADE LOGGING
+      let trades = [];
 
-if (fs.existsSync("trades.json")) {
-  trades = JSON.parse(fs.readFileSync("trades.json"));
-}
+      if (fs.existsSync("trades.json")) {
+        trades = JSON.parse(fs.readFileSync("trades.json"));
+      }
 
-const trade = {
-  repo: "Coffee Machine",
-  symbol: SYMBOL,
-  direction: fractalBreak,
-  entry: entry,
-  stop: finalStop,
-  tp: tp,
-  rr: RISK_REWARD,
-  openTime: isoTime,
-  closeTime: null,
-  result: null
-};
+      const trade = {
+        repo: "Coffee Machine",
+        symbol: SYMBOL,
+        direction: fractalBreak,
+        entry: entry,
+        stop: finalStop,
+        tp: tp,
+        rr: RISK_REWARD,
+        openTime: isoTime,
+        closeTime: null,
+        result: null
+      };
 
-trades.push(trade);
+      trades.push(trade);
 
-fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+      fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
 
-// ✅ existing reset logic
-state.activeDirection = null;
+      state.activeDirection = null;
       state.lastConfirmCandle = candleTime;
     }
 
