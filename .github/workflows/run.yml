@@ -44,7 +44,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions@github.com"
 
-          git add state.json
+          git add state.json trades.json
 
           # Exit safely if nothing changed
           git diff --cached --quiet && echo "No changes" && exit 0
