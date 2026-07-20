@@ -1,1 +1,14 @@
-[]
+[
+  {
+    "repo": "Coffee Machine",
+    "symbol": "stpRNG",
+    "direction": "BUY",
+    "entry": 7712,
+    "stop": 7702.808235294117,
+    "tp": 7725.7876470588235,
+    "rr": 1.5,
+    "openTime": "2026-07-20T04:30:00.000Z",
+    "closeTime": null,
+    "result": null
+  }
+]
