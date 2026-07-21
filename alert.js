@@ -5,7 +5,7 @@ import fs from "fs";
 const SYMBOL = "stpRNG";
 const SYMBOL_NAME = "📊 Step Index";
 
-const M5 = 300;          // ✅ Added for MACD warning
+const M5 = 300;
 const M15 = 900;
 const M30 = 1800;
 const CANDLES = 200;
@@ -30,7 +30,6 @@ let state = {
   lastConfirmCandle: null
 };
 
-// ✅ LOAD STATE
 try {
   if (fs.existsSync("state.json")) {
     state = JSON.parse(fs.readFileSync("state.json"));
@@ -114,16 +113,13 @@ function sma(data, length) {
   });
 }
 
-// ✅ EMA for MACD
 function ema(data, length) {
   let k = 2 / (length + 1);
   let emaArray = [];
   emaArray[0] = data[0];
-
   for (let i = 1; i < data.length; i++) {
     emaArray[i] = data[i] * k + emaArray[i - 1] * (1 - k);
   }
-
   return emaArray;
 }
 
@@ -169,7 +165,7 @@ function fractals(highs, lows) {
 
     await new Promise(resolve => setTimeout(resolve, 20000));
 
-    const m5 = await getCandles(M5);     // ✅ Added
+    const m5 = await getCandles(M5);
     const m15 = await getCandles(M15);
     const m30 = await getCandles(M30);
 
@@ -197,8 +193,6 @@ function fractals(highs, lows) {
     if (sma4[prev] >= sma34[prev] && sma4[last] < sma34[last]) {
       crossDirection = "SELL";
     }
-
-    // ✅ Trend change alert removed (logic kept)
 
     if (crossDirection && state.lastCrossCandle !== candleTime) {
       state.activeDirection = crossDirection;
@@ -244,25 +238,23 @@ RR: 1 : ${RISK_REWARD}
 Time: ${isoTime}`
       );
 
-      // ✅ OMNISIGHT TRADE LOGGING
-      let trades = [];
-      if (fs.existsSync("trades.json")) {
-        trades = JSON.parse(fs.readFileSync("trades.json"));
-      }
+      let trades = fs.existsSync("trades.json")
+        ? JSON.parse(fs.readFileSync("trades.json"))
+        : [];
 
       const trade = {
         id: `${SYMBOL}-${isoTime}`,
         repo: "Coffee Machine",
         symbol: SYMBOL,
         direction: fractalBreak,
-        entry: entry,
+        entry,
         stop: finalStop,
-        tp: tp,
+        tp,
         rr: RISK_REWARD,
         openTime: isoTime,
         closeTime: null,
         result: null,
-        warningSent: false   // ✅ Added
+        warningSent: false
       };
 
       trades.push(trade);
@@ -272,7 +264,7 @@ Time: ${isoTime}`
       state.lastConfirmCandle = candleTime;
     }
 
-    // ✅ MACD WARNING SYSTEM (M5)
+    // ✅ MACD WARNING SYSTEM (URGENT FORMAT)
     const trades = fs.existsSync("trades.json")
       ? JSON.parse(fs.readFileSync("trades.json"))
       : [];
@@ -280,18 +272,48 @@ Time: ${isoTime}`
     const openTrade = trades.find(t => t.result === null && !t.warningSent);
 
     if (openTrade) {
+
       const m5Closes = m5.map(c => parseFloat(c.close));
       const emaFast = ema(m5Closes, 4);
       const emaSlow = ema(m5Closes, 34);
-      const macdLine = emaFast[emaFast.length - 2] - emaSlow[emaSlow.length - 2];
+      const macd = emaFast[emaFast.length - 2] - emaSlow[emaSlow.length - 2];
+      const currentPrice = m5Closes[m5Closes.length - 2];
 
-      if (openTrade.direction === "BUY" && macdLine < 0) {
-        await sendTelegram(`⚠ CLOSE BUY NOW — MACD below zero`);
+      if (openTrade.direction === "BUY" && macd < 0) {
+
+        await sendTelegram(`
+⚠⚠⚠ CLOSE BUY TRADE NOW ⚠⚠⚠
+
+Repo: Coffee Machine
+Symbol: ${SYMBOL_NAME}
+Direction: BUY
+Entry: ${openTrade.entry}
+Current Price: ${currentPrice}
+
+MACD (M5) is below zero.
+
+EXIT IMMEDIATELY.
+`);
+
         openTrade.warningSent = true;
       }
 
-      if (openTrade.direction === "SELL" && macdLine > 0) {
-        await sendTelegram(`⚠ CLOSE SELL NOW — MACD above zero`);
+      if (openTrade.direction === "SELL" && macd > 0) {
+
+        await sendTelegram(`
+⚠⚠⚠ CLOSE SELL TRADE NOW ⚠⚠⚠
+
+Repo: Coffee Machine
+Symbol: ${SYMBOL_NAME}
+Direction: SELL
+Entry: ${openTrade.entry}
+Current Price: ${currentPrice}
+
+MACD (M5) is above zero.
+
+EXIT IMMEDIATELY.
+`);
+
         openTrade.warningSent = true;
       }
 
