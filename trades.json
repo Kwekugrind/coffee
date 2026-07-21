@@ -60,5 +60,18 @@
     "openTime": "2026-07-21T09:45:00.000Z",
     "closeTime": null,
     "result": null
+  },
+  {
+    "id": "stpRNG-2026-07-21T14:00:00.000Z",
+    "repo": "Coffee Machine",
+    "symbol": "stpRNG",
+    "direction": "SELL",
+    "entry": 7655.1,
+    "stop": 7665.629411764705,
+    "tp": 7639.305882352944,
+    "rr": 1.5,
+    "openTime": "2026-07-21T14:00:00.000Z",
+    "closeTime": null,
+    "result": null
   }
 ]
