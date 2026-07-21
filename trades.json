@@ -9,7 +9,8 @@
     "rr": 1.5,
     "openTime": "2026-07-20T04:30:00.000Z",
     "closeTime": null,
-    "result": null
+    "result": null,
+    "warningSent": true
   },
   {
     "repo": "Coffee Machine",
