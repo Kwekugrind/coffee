@@ -5,6 +5,7 @@ import fs from "fs";
 const SYMBOL = "stpRNG";
 const SYMBOL_NAME = "📊 Step Index";
 
+const M5 = 300;          // ✅ Added for MACD warning
 const M15 = 900;
 const M30 = 1800;
 const CANDLES = 200;
@@ -38,7 +39,6 @@ try {
   console.log("State load error.");
 }
 
-// ✅ STATE VISIBILITY
 console.log("✅ Loaded state at start:", state);
 
 async function sendTelegram(message) {
@@ -114,6 +114,19 @@ function sma(data, length) {
   });
 }
 
+// ✅ EMA for MACD
+function ema(data, length) {
+  let k = 2 / (length + 1);
+  let emaArray = [];
+  emaArray[0] = data[0];
+
+  for (let i = 1; i < data.length; i++) {
+    emaArray[i] = data[i] * k + emaArray[i - 1] * (1 - k);
+  }
+
+  return emaArray;
+}
+
 function calculateATR(candles, period) {
   let trs = [];
   for (let i = 1; i < candles.length; i++) {
@@ -156,6 +169,7 @@ function fractals(highs, lows) {
 
     await new Promise(resolve => setTimeout(resolve, 20000));
 
+    const m5 = await getCandles(M5);     // ✅ Added
     const m15 = await getCandles(M15);
     const m30 = await getCandles(M30);
 
@@ -184,23 +198,11 @@ function fractals(highs, lows) {
       crossDirection = "SELL";
     }
 
-    if (crossDirection && state.lastCrossCandle !== candleTime) {
+    // ✅ Trend change alert removed (logic kept)
 
+    if (crossDirection && state.lastCrossCandle !== candleTime) {
       state.activeDirection = crossDirection;
       state.lastCrossCandle = candleTime;
-
-      await sendTelegram(
-`══════════════════════
-${SYMBOL_NAME}
-══════════════════════
-
-🔄 TREND CHANGE → ${crossDirection}
-
-Price: ${closePrice}
-Time: ${isoTime}
-
-Waiting for M30 fractal break confirmation...`
-      );
     }
 
     const { up, down } = fractals(highs30, lows30);
@@ -234,27 +236,23 @@ Waiting for M30 fractal break confirmation...`
 `══════════════════════
 ${SYMBOL_NAME}
 ══════════════════════
-
 ✅ ${fractalBreak} CONFIRMED — Hybrid Stop
-
 Entry: ${entry}
 Stop: ${finalStop.toFixed(3)}
 TP: ${tp.toFixed(3)}
 RR: 1 : ${RISK_REWARD}
-
 Time: ${isoTime}`
       );
 
       // ✅ OMNISIGHT TRADE LOGGING
       let trades = [];
-
       if (fs.existsSync("trades.json")) {
         trades = JSON.parse(fs.readFileSync("trades.json"));
       }
 
       const trade = {
-        id: `${SYMBOL}-${isoTime}`,   // ✅ UNIQUE ID
-        repo: "Coffee Machine",       // change per repo
+        id: `${SYMBOL}-${isoTime}`,
+        repo: "Coffee Machine",
         symbol: SYMBOL,
         direction: fractalBreak,
         entry: entry,
@@ -263,15 +261,41 @@ Time: ${isoTime}`
         rr: RISK_REWARD,
         openTime: isoTime,
         closeTime: null,
-        result: null
+        result: null,
+        warningSent: false   // ✅ Added
       };
 
       trades.push(trade);
-
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
 
       state.activeDirection = null;
       state.lastConfirmCandle = candleTime;
+    }
+
+    // ✅ MACD WARNING SYSTEM (M5)
+    const trades = fs.existsSync("trades.json")
+      ? JSON.parse(fs.readFileSync("trades.json"))
+      : [];
+
+    const openTrade = trades.find(t => t.result === null && !t.warningSent);
+
+    if (openTrade) {
+      const m5Closes = m5.map(c => parseFloat(c.close));
+      const emaFast = ema(m5Closes, 4);
+      const emaSlow = ema(m5Closes, 34);
+      const macdLine = emaFast[emaFast.length - 2] - emaSlow[emaSlow.length - 2];
+
+      if (openTrade.direction === "BUY" && macdLine < 0) {
+        await sendTelegram(`⚠ CLOSE BUY NOW — MACD below zero`);
+        openTrade.warningSent = true;
+      }
+
+      if (openTrade.direction === "SELL" && macdLine > 0) {
+        await sendTelegram(`⚠ CLOSE SELL NOW — MACD above zero`);
+        openTrade.warningSent = true;
+      }
+
+      fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
     }
 
     if (DEBUG) {
