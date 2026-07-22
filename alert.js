@@ -226,8 +226,10 @@ function fractals(highs, lows) {
       }
 
       await sendTelegram(
-`✅ ${SYMBOL_NAME} CONFIRMED
-
+`══════════════════════
+${SYMBOL_NAME}
+══════════════════════
+✅ ${fractalBreak} CONFIRMED — Hybrid Stop
 Entry: ${entry}
 Stop: ${finalStop.toFixed(3)}
 TP: ${tp.toFixed(3)}
