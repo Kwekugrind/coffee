@@ -12,6 +12,6 @@
     "closeTime": null,
     "result": null,
     "warningSentOmni": false,
-    "warningSentBot": false
+    "warningSentBot": true
   }
 ]
