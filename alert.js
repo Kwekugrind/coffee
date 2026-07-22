@@ -163,7 +163,6 @@ function fractals(highs, lows) {
 
 (async () => {
   try {
-
     await new Promise(resolve => setTimeout(resolve, 20000));
 
     const m5 = await getCandles(M5);
@@ -213,7 +212,6 @@ function fractals(highs, lows) {
       fractalBreak = "SELL";
 
     if (fractalBreak && state.lastConfirmCandle !== candleTime) {
-
       let entry = closePrice;
       let finalStop, risk, tp;
 
@@ -237,7 +235,6 @@ RR: 1 : ${RISK_REWARD}
 Time: ${isoTime}`
       );
 
-      // ✅ OMNISIGHT TRADE LOGGING (With Entry Guard and Dual Flags)
       let trades = fs.existsSync("trades.json")
         ? JSON.parse(fs.readFileSync("trades.json"))
         : [];
@@ -257,8 +254,8 @@ Time: ${isoTime}`
           openTime: isoTime,
           closeTime: null,
           result: null,
-          warningSentOmni: false, // Flag for central 5m alerts
-          warningSentBot: false   // Flag for local 15m backup alerts
+          warningSentOmni: false,
+          warningSentBot: false
         };
 
         trades.push(trade);
@@ -269,7 +266,7 @@ Time: ${isoTime}`
       state.lastConfirmCandle = candleTime;
     }
 
-    // ✅ MACD WARNING SYSTEM (Bot Reminder Version)
+    // ✅ MACD WARNING SYSTEM -> IMMEDIATE STOP LOSS CLOSE
     let trades = fs.existsSync("trades.json")
       ? JSON.parse(fs.readFileSync("trades.json"))
       : [];
@@ -277,7 +274,6 @@ Time: ${isoTime}`
     const openTrade = trades.find(t => t.result === null && t.warningSentBot !== true);
 
     if (openTrade) {
-
       const m5Closes = m5.map(c => parseFloat(c.close));
       const m5emaFast = ema(m5Closes, 4);
       const m5emaSlow = ema(m5Closes, 34);
@@ -288,9 +284,8 @@ Time: ${isoTime}`
         (openTrade.direction === "BUY" && macd < 0) ||
         (openTrade.direction === "SELL" && macd > 0)
       ) {
-
         await sendTelegram(`
-⚠⚠⚠ CLOSE ${openTrade.direction} TRADE NOW ⚠⚠⚠
+⚠⚠⚠ [Bot SL HIT] CLOSE ${openTrade.direction} TRADE NOW ⚠⚠⚠
 
 [Bot Reminder]
 Repo: Coffee Machine
@@ -302,9 +297,12 @@ Current Price: ${currentPrice}
 MACD (M5) crossed zero.
 
 EXIT IMMEDIATELY.
+Result: STOP LOSS (-1.0R)
 `);
 
         openTrade.warningSentBot = true;
+        openTrade.result = "LOSS";
+        openTrade.closeTime = isoTime;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       }
     }
