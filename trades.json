@@ -1,17 +1,1 @@
-[
-  {
-    "id": "stpRNG-2026-07-22T13:15:00.000Z",
-    "repo": "Coffee Machine",
-    "symbol": "stpRNG",
-    "direction": "BUY",
-    "entry": 7653.1,
-    "stop": 7643.331764705884,
-    "tp": 7667.752352941176,
-    "rr": 1.5,
-    "openTime": "2026-07-22T13:15:00.000Z",
-    "closeTime": null,
-    "result": null,
-    "warningSentOmni": false,
-    "warningSentBot": true
-  }
-]
+[]
