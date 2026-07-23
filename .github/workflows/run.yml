@@ -1,19 +1,9 @@
-name: Coffee Machine
+name: V3.0 Signal & Trade Bot
 
 on:
   workflow_dispatch:
-    inputs:
-      source:
-        description: "Type 'cronjob' to run"
-        required: true
-        default: "manual"
-
-permissions:
-  contents: write
-
-concurrency:
-  group: coffee-machine
-  cancel-in-progress: true
+  schedule:
+    - cron: '*/5 * * * *'  # Runs every 5 minutes automatically
 
 jobs:
   run:
@@ -21,7 +11,7 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node
@@ -36,18 +26,14 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          TRIGGER_SOURCE: ${{ github.event.inputs.source }}
+          TRIGGER_SOURCE: "cronjob"
         run: node alert.js
 
-      - name: Commit state
+      - name: Commit state and trades update
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions@github.com"
-
           git add state.json trades.json
-
-          # Exit safely if nothing changed
           git diff --cached --quiet && echo "No changes" && exit 0
-
-          git commit -m "Auto update state"
+          git commit -m "Auto update bot state and trade logs"
           git push origin HEAD:main
