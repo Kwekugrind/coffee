@@ -1,1 +1,17 @@
-[]
+[
+  {
+    "id": "stpRNG-2026-07-23T22:20:00.000Z",
+    "repo": "Coffee Machine",
+    "symbol": "stpRNG",
+    "direction": "SELL",
+    "entry": 7665.9,
+    "sl": 7684.9,
+    "tp1": 7646.9,
+    "tp2": 7627.9,
+    "tp3": 7608.9,
+    "rr": 1.5,
+    "openTime": "2026-07-23 22:20:00",
+    "closeTime": null,
+    "result": null
+  }
+]
