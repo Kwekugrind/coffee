@@ -2,8 +2,15 @@ name: V3.0 Signal & Trade Bot
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/5 * * * *'  # Runs every 5 minutes automatically
+    inputs:
+      source:
+        description: "Trigger source"
+        required: false
+        default: "cronjob"
+      mode:
+        description: "Bot mode (scan, weekly, monthly)"
+        required: false
+        default: "scan"
 
 jobs:
   run:
@@ -26,7 +33,8 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          TRIGGER_SOURCE: "cronjob"
+          TRIGGER_SOURCE: ${{ github.event.inputs.source || 'cronjob' }}
+          MODE: ${{ github.event.inputs.mode || 'scan' }}
         run: node alert.js
 
       - name: Commit state and trades update
