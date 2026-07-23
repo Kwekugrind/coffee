@@ -281,6 +281,7 @@ async function runSummary(daysBack, title) {
 
     const i = candles.length - 2;
     const currentCandleEpoch = candles[i].epoch;
+    const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
 
     if (state.lastProcessedEpoch === currentCandleEpoch) return;
 
