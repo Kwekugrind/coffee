@@ -174,12 +174,14 @@ function getFractals(candles) {
   };
 }
 
-// ==================== D1 CONTEXT HELPER ====================
+// ==================== D1 CONTEXT HELPER (FIXED FOR TODAY'S CANDLE) ====================
 async function getD1Context() {
   try {
-    const d1Candles = await fetchCandles(D1, 1);
+    // Fetch last 2 daily candles so we are guaranteed to get today's ongoing candle as the last item
+    const d1Candles = await fetchCandles(D1, 2);
     if (!d1Candles || d1Candles.length === 0) return null;
-    const c = d1Candles[0];
+    
+    const c = d1Candles[d1Candles.length - 1]; // Grabs today's currently forming daily candle
     const open = parseFloat(c.open);
     const close = parseFloat(c.close);
 
