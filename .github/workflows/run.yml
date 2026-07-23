@@ -12,6 +12,10 @@ on:
         required: false
         default: "scan"
 
+concurrency:
+  group: signal-bot-execution
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
