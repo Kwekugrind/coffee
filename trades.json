@@ -57,7 +57,7 @@
     "rr": 1.5,
     "tp1Reached": false,
     "openTime": "2026-07-25 18:50:00",
-    "closeTime": null,
-    "result": null
+    "closeTime": "2026-07-25T23:45:14.661Z",
+    "result": "LOSS"
   }
 ]
