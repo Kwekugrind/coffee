@@ -3,8 +3,8 @@ import fetch from "node-fetch";
 import fs from "fs";
 
 // ==================== REPOSITORY CONFIGURATION ====================
-const SYMBOL = "stpRNG";
-const SYMBOL_NAME = "Step Index";
+const SYMBOL = "1HZ75V";
+const SYMBOL_NAME = "Volatility 75 Index (1s)";
 const REPO_LABEL = "Coffee Machine";
 // ==================================================================
 
