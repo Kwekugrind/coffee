@@ -146,7 +146,13 @@ async function runScanMode() {
         if (macdFlipped) { settledResult = "WIN"; exitReason = "MACD Trail Exit (after TP1)"; }
       } else {
         if (macdFlipped) {
-          settledResult = "LOSS"; exitReason = "MACD Early Exit (before TP1)";
+          const closedInProfit =
+            (openTrade.direction === "BUY"  && currentPrice >= openTrade.entry) ||
+            (openTrade.direction === "SELL" && currentPrice <= openTrade.entry);
+          settledResult = closedInProfit ? "WIN" : "LOSS";
+          exitReason = closedInProfit
+            ? "MACD Early Exit — Closed in Profit (before TP1)"
+            : "MACD Early Exit — Partial Loss (before SL hit)";
         } else if (openTrade.direction === "BUY" && currentPrice >= openTrade.tp1) {
           openTrade.tp1Reached = true; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
           await sendTelegram(`🎯 *TP1 Reached — Now Trailing!*\nSymbol: ${SYMBOL_NAME}\nDirection: BUY\nPrice: ${currentPrice.toFixed(4)} | TP1 was: ${openTrade.tp1.toFixed(4)}\n\nTrade will stay open while M5 MACD > 0.\nWill close when momentum fades.`);
@@ -193,8 +199,8 @@ async function runScanMode() {
     const sellSignal = state.waitingFor === "SELL" && fractalBreakDown && separationOk && sma34Slope < 0 && impulseOk && closePosSell >= 0.7 && closes[i] < opens[i];
 
     let signalTriggered = false, direction = "", entry, sl, risk, tp1, tp2, tp3;
-    if (buySignal) { signalTriggered = true; direction = "BUY"; entry = closes[i]; sl = fractals.significantLow !== null ? Math.min(fractals.significantLow, entry - atr14*1.5) : entry - atr14*1.5; risk = entry-sl; tp1 = entry+risk*RISK_REWARD; tp2 = entry+risk*2; tp3 = entry+risk*3; }
-    else if (sellSignal) { signalTriggered = true; direction = "SELL"; entry = closes[i]; sl = fractals.significantHigh !== null ? Math.max(fractals.significantHigh, entry + atr14*1.5) : entry + atr14*1.5; risk = sl-entry; tp1 = entry-risk*RISK_REWARD; tp2 = entry-risk*2; tp3 = entry-risk*3; }
+    if (buySignal) { signalTriggered = true; direction = "BUY"; entry = closes[i]; sl = fractals.significantLow !== null ? Math.min(fractals.significantLow, entry-atr14*1.5) : entry-atr14*1.5; risk = entry-sl; tp1 = entry+risk*RISK_REWARD; tp2 = entry+risk*2; tp3 = entry+risk*3; }
+    else if (sellSignal) { signalTriggered = true; direction = "SELL"; entry = closes[i]; sl = fractals.significantHigh !== null ? Math.max(fractals.significantHigh, entry+atr14*1.5) : entry+atr14*1.5; risk = sl-entry; tp1 = entry-risk*RISK_REWARD; tp2 = entry-risk*2; tp3 = entry-risk*3; }
 
     if (signalTriggered) {
       const d1 = await getD1Context();
