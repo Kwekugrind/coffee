@@ -144,61 +144,96 @@ async function runScanMode() {
     const i = candles.length - 2;
     const currentCandleEpoch = candles[i].epoch;
     const closes = candles.map(c => parseFloat(c.close));
-    const emaFast = ema(closes, 4), emaSlow = ema(closes, 34);
-    const macd = emaFast[i] - emaSlow[i];
+
+    // ── Dual MACD: slow(8,100) trails winners, fast(4,34) cuts losers ──
+    const emaFast = ema(closes, 4);
+    const emaSlow = ema(closes, 34);
+    const ema8    = ema(closes, 8);
+    const ema100  = ema(closes, 100);
+    const macdFast = emaFast[i] - emaSlow[i];   // 4,34 — reacts quickly, cuts losses
+    const macdSlow = ema8[i]   - ema100[i];     // 8,100 — slow trail, lets winners run
+
     let openTrade = trades.find(t => t.result === null);
 
     if (openTrade) {
       const currentPrice = await getCurrentPrice();
-      const macdFlipped = (openTrade.direction === "BUY" && macd < 0) || (openTrade.direction === "SELL" && macd > 0);
-      const slHit =
-        (openTrade.direction === "BUY"  && currentPrice <= openTrade.sl) ||
-        (openTrade.direction === "SELL" && currentPrice >= openTrade.sl);
+
+      const inProfit = (openTrade.direction === "BUY"  && currentPrice >= openTrade.entry) ||
+                       (openTrade.direction === "SELL" && currentPrice <= openTrade.entry);
+
+      // Reset 2-candle flip tracker when price crosses entry (profit mode changes)
+      if (openTrade.lastInProfit !== null && openTrade.lastInProfit !== inProfit) {
+        openTrade.macdEarlyFlipEpoch = null;
+      }
+      openTrade.lastInProfit = inProfit;
+
+      // Select which MACD controls the exit
+      const activeMACD = inProfit ? macdSlow : macdFast;
+      const macdFlipped = (openTrade.direction === "BUY"  && activeMACD < 0) ||
+                          (openTrade.direction === "SELL" && activeMACD > 0);
+
+      const slHit = (openTrade.direction === "BUY"  && currentPrice <= openTrade.sl) ||
+                    (openTrade.direction === "SELL" && currentPrice >= openTrade.sl);
 
       let settledResult = null, exitReason = "";
 
       if (slHit) {
         settledResult = "LOSS";
         exitReason = "Stop Loss Hit";
-      } else if (openTrade.tp1Reached) {
-        if (macdFlipped) { settledResult = "WIN"; exitReason = "MACD Trail Exit (after TP1)"; }
       } else {
-        // ── Phase 1: Before TP1 ──
+        // TP1 notification (informational only — no longer controls exit phase)
+        if (!openTrade.tp1Reached) {
+          if ((openTrade.direction === "BUY"  && currentPrice >= openTrade.tp1) ||
+              (openTrade.direction === "SELL" && currentPrice <= openTrade.tp1)) {
+            openTrade.tp1Reached = true;
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+            await sendTelegram(
+              `🎯 *TP1 Hit!*\n` +
+              `Symbol: ${SYMBOL_NAME}\nDirection: ${openTrade.direction}\n` +
+              `Price: ${currentPrice.toFixed(4)} | TP1: ${openTrade.tp1.toFixed(4)}\n\n` +
+              `Now trailing with MACD(8,100). Will hold while trend continues.`
+            );
+          }
+        }
+
+        // 2-candle MACD confirmation exit
         if (macdFlipped) {
           if (!openTrade.macdEarlyFlipEpoch) {
             openTrade.macdEarlyFlipEpoch = currentCandleEpoch;
             fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
           } else if (openTrade.macdEarlyFlipEpoch !== currentCandleEpoch) {
-            const closedInProfit =
-              (openTrade.direction === "BUY"  && currentPrice >= openTrade.entry) ||
-              (openTrade.direction === "SELL" && currentPrice <= openTrade.entry);
-            settledResult = closedInProfit ? "WIN" : "LOSS";
-            exitReason = closedInProfit
-              ? "MACD Early Exit — Closed in Profit (before TP1)"
-              : "MACD Early Exit — Partial Loss (before SL hit)";
+            settledResult = inProfit ? "WIN" : "LOSS";
+            exitReason = inProfit
+              ? "MACD(8,100) Trail Exit — held above entry"
+              : "MACD(4,34) Early Exit — price below entry";
           }
         } else {
           if (openTrade.macdEarlyFlipEpoch) {
             openTrade.macdEarlyFlipEpoch = null;
             fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
           }
-          if (openTrade.direction === "BUY" && currentPrice >= openTrade.tp1) {
-            openTrade.tp1Reached = true; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-            await sendTelegram(`🎯 *TP1 Reached — Now Trailing!*\nSymbol: ${SYMBOL_NAME}\nDirection: BUY\nPrice: ${currentPrice.toFixed(4)} | TP1 was: ${openTrade.tp1.toFixed(4)}\n\nTrade will stay open while M5 MACD > 0.\nWill close when momentum fades.`);
-          } else if (openTrade.direction === "SELL" && currentPrice <= openTrade.tp1) {
-            openTrade.tp1Reached = true; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-            await sendTelegram(`🎯 *TP1 Reached — Now Trailing!*\nSymbol: ${SYMBOL_NAME}\nDirection: SELL\nPrice: ${currentPrice.toFixed(4)} | TP1 was: ${openTrade.tp1.toFixed(4)}\n\nTrade will stay open while M5 MACD < 0.\nWill close when momentum fades.`);
-          }
         }
       }
 
       if (settledResult) {
-        openTrade.result = settledResult; openTrade.closeTime = new Date().toISOString();
+        openTrade.result = settledResult;
+        openTrade.closeTime = new Date().toISOString();
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
         const icon = settledResult === "WIN" ? "✅" : "❌";
-        const phase = openTrade.tp1Reached ? "Trailed past TP1 ✅" : "Closed before TP1";
         const durationMins = Math.round((new Date(openTrade.closeTime) - new Date(openTrade.openTime)) / 60000);
-        await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${settledResult}*\n\nDirection: ${openTrade.direction}\nSymbol:    ${SYMBOL_NAME}\n\n📍 Entry:  ${openTrade.entry.toFixed(4)}\n🏁 Exit:   ${currentPrice.toFixed(4)}\n🛑 SL:     ${openTrade.sl.toFixed(4)}\n🎯 TP1:    ${openTrade.tp1.toFixed(4)}  (${RISK_REWARD}R)\n\nPhase:     ${phase}\nReason:    ${exitReason}\nDuration:  ~${durationMins} min\n\nOpened:  ${openTrade.openTime.substring(0,16).replace("T"," ")} UTC\nClosed:  ${openTrade.closeTime.substring(0,16).replace("T"," ")} UTC`);
+        const tp1Status = openTrade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
+        await sendTelegram(
+          `${icon} *${REPO_LABEL} — Trade ${settledResult}*\n\n` +
+          `Direction: ${openTrade.direction}\nSymbol:    ${SYMBOL_NAME}\n\n` +
+          `📍 Entry:  ${openTrade.entry.toFixed(4)}\n` +
+          `🏁 Exit:   ${currentPrice.toFixed(4)}\n` +
+          `🛑 SL:     ${openTrade.sl.toFixed(4)}\n` +
+          `🎯 TP1:    ${openTrade.tp1.toFixed(4)}  (${RISK_REWARD}R)  ${tp1Status}\n\n` +
+          `Reason:    ${exitReason}\n` +
+          `Duration:  ~${durationMins} min\n\n` +
+          `Opened:  ${openTrade.openTime.substring(0, 16).replace("T", " ")} UTC\n` +
+          `Closed:  ${openTrade.closeTime.substring(0, 16).replace("T", " ")} UTC`
+        );
       }
       return;
     }
@@ -238,12 +273,17 @@ async function runScanMode() {
       const alignment = d1 ? checkAlignment(direction, d1.direction) : "⚠️ D1 data unavailable";
       const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
       const h1Line = h1Ema50 ? `H1 EMA50:  ${h1Ema50.toFixed(4)}  ✅ Trend aligned\n` : `H1 EMA50:  ⚠️ Data unavailable\n`;
-      let message = `🚨 ${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry:  ${entry.toFixed(4)}\n🛑 SL:     ${sl.toFixed(4)}\n🎯 TP1:    ${tp1.toFixed(4)}  (${RISK_REWARD}R) → trail with MACD after\n🎯 TP2:    ${tp2.toFixed(4)}  (2R)\n🎯 TP3:    ${tp3.toFixed(4)}  (3R)\n\n📊 Risk:   ${risk.toFixed(2)} points\n${h1Line}🔥 Setup:  Fractal break + H1 trend confirmed\n━━━━━━━━━━━━━━━━━━━━\n📅 D1 CANDLE STATUS\n━━━━━━━━━━━━━━━━━━━━\n`;
+      let message = `🚨 ${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry:  ${entry.toFixed(4)}\n🛑 SL:     ${sl.toFixed(4)}\n🎯 TP1:    ${tp1.toFixed(4)}  (${RISK_REWARD}R) → trail with MACD(8,100) after\n🎯 TP2:    ${tp2.toFixed(4)}  (2R)\n🎯 TP3:    ${tp3.toFixed(4)}  (3R)\n\n📊 Risk:   ${risk.toFixed(2)} points\n${h1Line}🔥 Setup:  Fractal break + H1 trend confirmed\n━━━━━━━━━━━━━━━━━━━━\n📅 D1 CANDLE STATUS\n━━━━━━━━━━━━━━━━━━━━\n`;
       if (d1) message += `Direction:  ${d1.direction}\nD1 Open:    ${d1.open.toFixed(4)}\nD1 Current: ${d1.close.toFixed(4)}\nMovement:   ${d1.change.toFixed(4)} pts (${d1.changePct.toFixed(2)}%)\nAlignment:  ${alignment}\n\n`;
       else message += `⚠️ D1 data unavailable\n\n`;
       message += `⏰ Time (UTC): ${timeFormatted}`;
       await sendTelegram(message);
-      trades.push({ id: `${SYMBOL}-${isoTime}`, repo: REPO_LABEL, symbol: SYMBOL, direction, entry, sl, tp1, tp2, tp3, rr: RISK_REWARD, tp1Reached: false, macdEarlyFlipEpoch: null, openTime: timeFormatted, closeTime: null, result: null });
+      trades.push({
+        id: `${SYMBOL}-${isoTime}`, repo: REPO_LABEL, symbol: SYMBOL,
+        direction, entry, sl, tp1, tp2, tp3, rr: RISK_REWARD,
+        tp1Reached: false, macdEarlyFlipEpoch: null, lastInProfit: null,
+        openTime: timeFormatted, closeTime: null, result: null
+      });
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       state.waitingFor = null; state.setupEpoch = null;
     }
