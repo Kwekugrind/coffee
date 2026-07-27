@@ -107,5 +107,22 @@
     "openTime": "2026-07-26 15:20:00",
     "closeTime": "2026-07-26T17:45:12.708Z",
     "result": "LOSS"
+  },
+  {
+    "id": "1HZ75V-2026-07-27T05:55:00.000Z",
+    "repo": "Coffee Machine",
+    "symbol": "1HZ75V",
+    "direction": "SELL",
+    "entry": 6975.79,
+    "sl": 7145.93,
+    "tp1": 6720.58,
+    "tp2": 6635.509999999999,
+    "tp3": 6465.369999999999,
+    "rr": 1.5,
+    "tp1Reached": false,
+    "macdEarlyFlipEpoch": null,
+    "openTime": "2026-07-27 05:55:00",
+    "closeTime": null,
+    "result": null
   }
 ]
