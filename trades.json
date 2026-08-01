@@ -1,1 +1,22 @@
-[]
+[
+  {
+    "id": "1HZ75V-2026-08-01T15:00:00.000Z",
+    "contractId": 7634056579,
+    "repo": "Coffee Machine",
+    "symbol": "1HZ75V",
+    "direction": "BUY",
+    "entry": 7722.31,
+    "sl": 7554.49,
+    "tp1": 7974.040000000001,
+    "tp2": 8057.950000000002,
+    "tp3": 8225.770000000002,
+    "h1OpenAtEntry": 7695.36,
+    "tp1Reached": false,
+    "macdEarlyFlipEpoch": null,
+    "lastInProfit": null,
+    "rr": 1.5,
+    "openTime": "2026-08-01 15:00:00",
+    "closeTime": null,
+    "result": null
+  }
+]
