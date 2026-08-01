@@ -15,6 +15,7 @@ const ATR_PERIOD = 14;
 const FRACTAL_LOOKBACK = 8;
 const SETUP_EXPIRY_BARS = 15;
 const RISK_REWARD = 1.5;
+const STAKE_USD = 10;
 
 const TG_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT = process.env.TG_CHAT_ID;
@@ -128,6 +129,14 @@ function checkAlignment(signalDir, d1Dir) {
   return "⚠️ COUNTER-TREND to daily";
 }
 
+function formatDuration(mins) {
+  if (mins < 60) return `~${mins} min`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  const hStr = `${h} hour${h !== 1 ? 's' : ''}`;
+  return m > 0 ? `~${hStr} ${m} min` : `~${hStr}`;
+}
+
 async function runSummary(daysBack, title) {
   let trades = fs.existsSync("trades.json") ? JSON.parse(fs.readFileSync("trades.json")) : [];
   const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - daysBack);
@@ -171,13 +180,11 @@ async function runScanMode() {
       const inProfit = (openTrade.direction === "BUY"  && currentPrice >= openTrade.entry) ||
                        (openTrade.direction === "SELL" && currentPrice <= openTrade.entry);
 
-      // Reset 2-candle flip tracker when price crosses entry (profit mode changes)
       if (openTrade.lastInProfit !== null && openTrade.lastInProfit !== inProfit) {
         openTrade.macdEarlyFlipEpoch = null;
       }
       openTrade.lastInProfit = inProfit;
 
-      // Select which MACD controls the exit
       const activeMACD = inProfit ? macdSlow : macdFast;
       const macdFlipped = (openTrade.direction === "BUY"  && activeMACD < 0) ||
                           (openTrade.direction === "SELL" && activeMACD > 0);
@@ -191,7 +198,6 @@ async function runScanMode() {
         settledResult = "LOSS";
         exitReason = "Stop Loss Hit";
       } else {
-        // TP1 notification (informational only — no longer controls exit phase)
         if (!openTrade.tp1Reached) {
           if ((openTrade.direction === "BUY"  && currentPrice >= openTrade.tp1) ||
               (openTrade.direction === "SELL" && currentPrice <= openTrade.tp1)) {
@@ -206,7 +212,6 @@ async function runScanMode() {
           }
         }
 
-        // 2-candle MACD confirmation exit
         if (macdFlipped) {
           if (!openTrade.macdEarlyFlipEpoch) {
             openTrade.macdEarlyFlipEpoch = currentCandleEpoch;
@@ -232,6 +237,12 @@ async function runScanMode() {
         const icon = settledResult === "WIN" ? "✅" : "❌";
         const durationMins = Math.round((new Date(openTrade.closeTime) - new Date(openTrade.openTime)) / 60000);
         const tp1Status = openTrade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
+        const slDollars = STAKE_USD * 0.5;
+        const risk = openTrade.direction === "BUY" ? openTrade.entry - openTrade.sl : openTrade.sl - openTrade.entry;
+        const pnlDollars = exitReason === "Stop Loss Hit"
+          ? -slDollars
+          : parseFloat(((openTrade.direction === "BUY" ? currentPrice - openTrade.entry : openTrade.entry - currentPrice) / risk * slDollars).toFixed(2));
+        const pnlStr = pnlDollars >= 0 ? `+$${pnlDollars.toFixed(2)}` : `-$${Math.abs(pnlDollars).toFixed(2)}`;
         await sendTelegram(
           `${icon} *${REPO_LABEL} — Trade ${settledResult}*\n\n` +
           `Direction: ${openTrade.direction}\nSymbol:    ${SYMBOL_NAME}\n\n` +
@@ -239,8 +250,9 @@ async function runScanMode() {
           `🏁 Exit:   ${currentPrice.toFixed(4)}\n` +
           `🛑 SL:     ${openTrade.sl.toFixed(4)}\n` +
           `🎯 TP1:    ${openTrade.tp1.toFixed(4)}  (${RISK_REWARD}R)  ${tp1Status}\n\n` +
+          `💵 P&L:    ${pnlStr}\n` +
           `Reason:    ${exitReason}\n` +
-          `Duration:  ~${durationMins} min\n\n` +
+          `Duration:  ${formatDuration(durationMins)}\n\n` +
           `Opened:  ${openTrade.openTime.substring(0, 16).replace("T", " ")} UTC\n` +
           `Closed:  ${openTrade.closeTime.substring(0, 16).replace("T", " ")} UTC`
         );
