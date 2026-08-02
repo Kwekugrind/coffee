@@ -154,7 +154,7 @@ async function executeManualClose(result, reason) {
 })();
 
 let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0 };
-try { if (fs.existsSync("state.json")) state = { ...state, ...JSON.parse(fs.readFileSync("state.json")); } catch (e) { console.log("State load error, starting fresh."); }
+try { if (fs.existsSync("state.json")) state = { ...state, ...JSON.parse(fs.readFileSync("state.json")) }; } catch (e) { console.log("State load error, starting fresh."); }
 
 function openWS() { return new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${MARKET_DATA_APP_ID}`, { headers: { "Origin": "https://deriv.com" } }); }
 
