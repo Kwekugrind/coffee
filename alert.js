@@ -289,8 +289,6 @@ async function runScanMode() {
     const atr14 = calculateATR(candles, ATR_PERIOD);
     const bodies = candles.map(c => Math.abs(parseFloat(c.close) - parseFloat(c.open)));
     const avgBody = sma(bodies, 20)[i] || 0;
-    const bodies = candles.map(c => Math.abs(parseFloat(c.close) - parseFloat(c.open)));
-    const avgBody = sma(bodies, 20)[i] || 0;
     const crossUp = (smaFast[i-1] <= smaSlow[i-1]) && (smaFast[i] > smaSlow[i]);
     const crossDn = (smaFast[i-1] >= smaSlow[i-1]) && (smaFast[i] < smaSlow[i]);
     if (crossUp) { state.waitingFor = "BUY"; state.setupEpoch = currentCandleEpoch; }
