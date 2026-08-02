@@ -76,6 +76,53 @@ async function runSummary(daysBack, title) {
   await sendTelegram(`📊 *${REPO_LABEL} — ${title}*\n\nTrades:    ${periodTrades.length}\nWins:      ${wins}  |  Losses: ${losses}\nWin Rate:  ${winRate}%\nNet R:     ${netR.toFixed(1)}R\nNet P&L:   $${netDollars >= 0 ? "+" : ""}${netDollars}`);
 }
 
+async function checkTelegramCommands() {
+  if (!TG_TOKEN || !TG_CHAT) return null;
+  try {
+    const offset = state.lastTgUpdateId ? state.lastTgUpdateId + 1 : 0;
+    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?offset=${offset}&limit=20&timeout=0`);
+    const data = await res.json();
+    if (!data.ok || !data.result || data.result.length === 0) return null;
+    let command = null;
+    for (const update of data.result) {
+      state.lastTgUpdateId = Math.max(state.lastTgUpdateId || 0, update.update_id);
+      const msg = update.message;
+      if (!msg) continue;
+      if (String(msg.chat.id) !== String(TG_CHAT)) continue;
+      const text = (msg.text || "").toLowerCase().trim();
+      if (text === "/close win" || text === "/closewin") command = "WIN";
+      else if (text === "/close loss" || text === "/closeloss") command = "LOSS";
+    }
+    return command;
+  } catch (err) { console.error("Telegram poll error:", err.message); return null; }
+}
+
+async function executeManualClose(result, reason) {
+  let trades = fs.existsSync("trades.json") ? JSON.parse(fs.readFileSync("trades.json")) : [];
+  const openTrade = trades.find(t => t.result === null);
+  if (!openTrade) {
+    await sendTelegram(`⚠️ *${REPO_LABEL}*\n\nNo open trade found to close.`);
+    return;
+  }
+  console.log(`🔄 Manual ${result} close requested: ${reason}`);
+  let currentPrice = null;
+  try { currentPrice = await getCurrentPrice(); } catch (e) { console.error("Price fetch error:", e.message); }
+  try { await closeContract(openTrade.contractId); } catch (e) { console.error("Close contract error:", e.message); }
+  openTrade.result = result;
+  openTrade.closeTime = new Date().toISOString();
+  fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+  const icon = result === "WIN" ? "✅" : "❌";
+  const contractType = openTrade.direction === "BUY" ? "MULTUP" : "MULTDOWN";
+  const durationMins = Math.round((new Date(openTrade.closeTime) - new Date(openTrade.openTime)) / 60000);
+  const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
+  const tpDollars = parseFloat((slDollars * RISK_REWARD).toFixed(2));
+  const tp1Status = openTrade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
+  const exitPriceStr = currentPrice ? currentPrice.toFixed(4) : "unknown";
+  await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol:    ${SYMBOL_NAME}\n\n📍 Entry:  ${openTrade.entry.toFixed(4)}\n🏁 Exit:   ${exitPriceStr}\n🛑 SL:     ${openTrade.sl.toFixed(4)}  ($${slDollars} hard)\n🎯 TP1:    ${openTrade.tp1.toFixed(4)}  ($${tpDollars} soft)  ${tp1Status}\n\nReason:    ${reason}\nDuration:  ${formatDuration(durationMins)}\n\nOpened:  ${openTrade.openTime.substring(0,16).replace("T"," ")} UTC\nClosed:  ${openTrade.closeTime.substring(0,16).replace("T"," ")} UTC\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
+  console.log(`✅ Manual close complete: ${result}`);
+}
+
+
 (async () => {
   if (MODE === "daily")   { await runSummary(1,  "Daily Report");   process.exit(0); }
   if (MODE === "weekly")  { await runSummary(7,  "Weekly Report");  process.exit(0); }
@@ -92,12 +139,22 @@ async function runSummary(daysBack, title) {
     } catch (err) { console.error("❌ Test trade error:", err.message); await sendTelegram(`❌ *Test Trade Failed*\nError: ${err.message}\n\nCheck Actions logs for full details.`); }
     process.exit(0);
   }
+  if (MODE === "close_win") {
+    await executeManualClose("WIN", "Manual Close — Profit taken");
+    fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+    process.exit(0);
+  }
+  if (MODE === "close_loss") {
+    await executeManualClose("LOSS", "Manual Close — Loss accepted");
+    fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+    process.exit(0);
+  }
   if (TRIGGER_SOURCE !== "cronjob") { console.log("⛔ Blocked: Not a cronjob trigger."); process.exit(0); }
   await runScanMode();
 })();
 
-let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null };
-try { if (fs.existsSync("state.json")) state = JSON.parse(fs.readFileSync("state.json")); } catch (e) { console.log("State load error, starting fresh."); }
+let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0 };
+try { if (fs.existsSync("state.json")) state = { ...state, ...JSON.parse(fs.readFileSync("state.json")); } catch (e) { console.log("State load error, starting fresh."); }
 
 function openWS() { return new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${MARKET_DATA_APP_ID}`, { headers: { "Origin": "https://deriv.com" } }); }
 
@@ -203,6 +260,15 @@ function checkAlignment(signalDir, d1Dir) { if (signalDir === "BUY" && d1Dir ===
 
 async function runScanMode() {
   try {
+    const tgCommand = await checkTelegramCommands();
+    fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+    if (tgCommand) {
+      const reason = tgCommand === "WIN" ? "Manual Close via Telegram — Profit taken" : "Manual Close via Telegram — Loss accepted";
+      await executeManualClose(tgCommand, reason);
+      fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+      return;
+    }
+
     let trades = fs.existsSync("trades.json") ? JSON.parse(fs.readFileSync("trades.json")) : [];
     const candles = await fetchCandles(M5, CANDLES);
     if (!candles || candles.length < 50) return;
