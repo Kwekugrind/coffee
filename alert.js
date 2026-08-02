@@ -15,12 +15,14 @@ const CANDLES = 200;
 
 const ATR_PERIOD = 14;
 const FRACTAL_LOOKBACK = 8;
-const SETUP_EXPIRY_BARS = 15;
+const SETUP_EXPIRY_BARS = 35;
 const RISK_REWARD = 1.5;
 const STAKE_USD = 10;
 const MULTIPLIER = 50;
 
-const SAFETY_TP_USD = 30;
+const SAFETY_TP_USD = 15;
+const HIGH_WATER_ACTIVATE_USD = 5;
+const HIGH_WATER_DRAWDOWN_USD = 3;
 const MARKET_DATA_APP_ID = "1089";
 const DERIV_APP_ID = process.env.DERIV_APP_ID;
 
@@ -70,7 +72,7 @@ async function runSummary(daysBack, title) {
   const netR = periodTrades.reduce((s, t) => s + (t.result === "WIN" ? t.rr : -1), 0);
   const winRate = ((wins / periodTrades.length) * 100).toFixed(1);
   const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
-  const netDollars = parseFloat((netR * slDollars).toFixed(2));
+  const netDollars = parseFloat(periodTrades.reduce((s, t) => s + (t.pnlUSD != null ? t.pnlUSD : (t.result === "WIN" ? t.rr * slDollars : -slDollars)), 0).toFixed(2));
   await sendTelegram(`📊 *${REPO_LABEL} — ${title}*\n\nTrades:    ${periodTrades.length}\nWins:      ${wins}  |  Losses: ${losses}\nWin Rate:  ${winRate}%\nNet R:     ${netR.toFixed(1)}R\nNet P&L:   $${netDollars >= 0 ? "+" : ""}${netDollars}`);
 }
 
@@ -181,6 +183,13 @@ async function closeContract(contractId) {
 function sma(data, period) { return data.map((_, i, arr) => { if (i < period - 1) return null; return arr.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0) / period; }); }
 function ema(data, period) { const k = 2 / (period + 1); let e = [data[0]]; for (let i = 1; i < data.length; i++) e[i] = data[i] * k + e[i-1] * (1-k); return e; }
 function calculateATR(candles, period) { let trs = []; for (let i = 1; i < candles.length; i++) { const h = parseFloat(candles[i].high), l = parseFloat(candles[i].low), pc = parseFloat(candles[i-1].close); trs.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc))); } return trs.slice(-period).reduce((a,b) => a+b, 0) / period; }
+
+function calcUnrealizedPnL(direction, entry, currentPrice) {
+  const pct = direction === "BUY"
+    ? (currentPrice - entry) / entry
+    : (entry - currentPrice) / entry;
+  return pct * STAKE_USD * MULTIPLIER;
+}
 function getFractals(candles) { let pool = []; for (let i = 2; i < candles.length-2; i++) { const h = parseFloat(candles[i].high); if (h > parseFloat(candles[i-1].high) && h > parseFloat(candles[i-2].high) && h > parseFloat(candles[i+1].high) && h > parseFloat(candles[i+2].high)) pool.push(h); const l = parseFloat(candles[i].low); if (l < parseFloat(candles[i-1].low) && l < parseFloat(candles[i-2].low) && l < parseFloat(candles[i+1].low) && l < parseFloat(candles[i+2].low)) pool.push(l); } const recent = pool.slice(-FRACTAL_LOOKBACK); return { significantHigh: recent.length > 0 ? Math.max(...recent) : null, significantLow: recent.length > 0 ? Math.min(...recent) : null }; }
 
 async function fetchH1Data() {
@@ -205,18 +214,40 @@ async function runScanMode() {
     let openTrade = trades.find(t => t.result === null);
     if (openTrade) {
       const currentPrice = await getCurrentPrice();
+      const unrealizedPnL = calcUnrealizedPnL(openTrade.direction, openTrade.entry, currentPrice);
+      let settledResult = null, exitReason = "", derivAlreadyClosed = false;
+      if (unrealizedPnL >= SAFETY_TP_USD) {
+        settledResult = "WIN"; exitReason = `Safety TP hit — $${SAFETY_TP_USD} ceiling reached`; derivAlreadyClosed = true;
+      }
+      if (!settledResult && unrealizedPnL >= HIGH_WATER_ACTIVATE_USD) {
+        if (openTrade.peakProfit == null || unrealizedPnL > openTrade.peakProfit) {
+          openTrade.peakProfit = unrealizedPnL;
+          fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+        }
+        if (unrealizedPnL <= openTrade.peakProfit - HIGH_WATER_DRAWDOWN_USD) {
+          settledResult = "WIN";
+          exitReason = `Profit trail exit — locked ~$${unrealizedPnL.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)})`;
+        }
+      }
       const inProfit = (openTrade.direction === "BUY" && currentPrice >= openTrade.entry) || (openTrade.direction === "SELL" && currentPrice <= openTrade.entry);
       if (openTrade.lastInProfit !== null && openTrade.lastInProfit !== inProfit) openTrade.macdEarlyFlipEpoch = null;
       openTrade.lastInProfit = inProfit;
       const activeMACD = inProfit ? macdSlow : macdFast;
       const macdFlipped = (openTrade.direction === "BUY" && activeMACD < 0) || (openTrade.direction === "SELL" && activeMACD > 0);
       const slHit = (openTrade.direction === "BUY" && currentPrice <= openTrade.sl) || (openTrade.direction === "SELL" && currentPrice >= openTrade.sl);
-      let settledResult = null, exitReason = "", derivAlreadyClosed = false;
+      if (!settledResult) {
       if (slHit) { settledResult = "LOSS"; exitReason = "Stop Loss Hit (Deriv hard SL)"; derivAlreadyClosed = true; }
       else {
         if (!inProfit && openTrade.h1OpenAtEntry != null) {
           const h1Breach = (openTrade.direction === "BUY" && closes[i] < openTrade.h1OpenAtEntry) || (openTrade.direction === "SELL" && closes[i] > openTrade.h1OpenAtEntry);
-          if (h1Breach) { settledResult = "LOSS"; exitReason = "H1 Open Break — early loss cut"; }
+          if (h1Breach) {
+            const h4ForExit = await fetchH4Candle();
+            const h4TurnedAgainst = h4ForExit && (
+              (openTrade.direction === "BUY" && parseFloat(h4ForExit.close) < parseFloat(h4ForExit.open)) ||
+              (openTrade.direction === "SELL" && parseFloat(h4ForExit.close) > parseFloat(h4ForExit.open))
+            );
+            if (h4TurnedAgainst) { settledResult = "LOSS"; exitReason = "H1 Open Break + H4 reversal — early loss cut"; }
+          }
         }
         if (!settledResult) {
           if (!openTrade.tp1Reached) {
@@ -232,6 +263,7 @@ async function runScanMode() {
           } else { if (openTrade.macdEarlyFlipEpoch) { openTrade.macdEarlyFlipEpoch = null; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2)); } }
         }
       }
+      } // end !settledResult
       if (settledResult) {
         if (!derivAlreadyClosed) await closeContract(openTrade.contractId);
         openTrade.result = settledResult; openTrade.closeTime = new Date().toISOString();
@@ -243,8 +275,9 @@ async function runScanMode() {
         const tp1Status = openTrade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
         const risk = openTrade.direction === "BUY" ? openTrade.entry - openTrade.sl : openTrade.sl - openTrade.entry;
         const isHardSL = exitReason.includes("Stop Loss Hit");
-        const pnlDollars = isHardSL ? -slDollars : parseFloat(((openTrade.direction === "BUY" ? currentPrice - openTrade.entry : openTrade.entry - currentPrice) / risk * slDollars).toFixed(2));
+        const pnlDollars = isHardSL ? -slDollars : parseFloat(calcUnrealizedPnL(openTrade.direction, openTrade.entry, currentPrice).toFixed(2));
         const pnlStr = pnlDollars >= 0 ? `+$${pnlDollars.toFixed(2)}` : `-$${Math.abs(pnlDollars).toFixed(2)}`;
+        openTrade.pnlUSD = pnlDollars; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
         await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${settledResult}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol:    ${SYMBOL_NAME}\n\n📍 Entry:  ${openTrade.entry.toFixed(4)}\n🏁 Exit:   ${currentPrice.toFixed(4)}\n🛑 SL:     ${openTrade.sl.toFixed(4)}  ($${slDollars} hard)\n🎯 TP1:    ${openTrade.tp1.toFixed(4)}  ($${tpDollars} soft)  ${tp1Status}\n\n💵 P&L:    ${pnlStr}\nReason:    ${exitReason}\nDuration:  ${formatDuration(durationMins)}\n\nOpened:  ${openTrade.openTime.substring(0,16).replace("T"," ")} UTC\nClosed:  ${openTrade.closeTime.substring(0,16).replace("T"," ")} UTC\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
       }
       return;
@@ -256,6 +289,8 @@ async function runScanMode() {
     const atr14 = calculateATR(candles, ATR_PERIOD);
     const bodies = candles.map(c => Math.abs(parseFloat(c.close) - parseFloat(c.open)));
     const avgBody = sma(bodies, 20)[i] || 0;
+    const bodies = candles.map(c => Math.abs(parseFloat(c.close) - parseFloat(c.open)));
+    const avgBody = sma(bodies, 20)[i] || 0;
     const crossUp = (smaFast[i-1] <= smaSlow[i-1]) && (smaFast[i] > smaSlow[i]);
     const crossDn = (smaFast[i-1] >= smaSlow[i-1]) && (smaFast[i] < smaSlow[i]);
     if (crossUp) { state.waitingFor = "BUY"; state.setupEpoch = currentCandleEpoch; }
@@ -264,7 +299,7 @@ async function runScanMode() {
     const candleRange = highs[i] - lows[i];
     const closePosBuy = (closes[i] - lows[i]) / candleRange, closePosSell = (highs[i] - closes[i]) / candleRange;
     const smaSeparation = Math.abs(smaFast[i] - smaSlow[i]), sma34Slope = smaSlow[i] - smaSlow[i-3];
-    const separationOk = smaSeparation > (atr14 * 0.5), impulseOk = bodies[i] > (avgBody * 1.5);
+    const separationOk = smaSeparation > (atr14 * 0.3), impulseOk = bodies[i] > (avgBody * 1.5);
     const fractals = getFractals(candles);
     const fractalBreakUp = fractals.significantHigh !== null && closes[i] > fractals.significantHigh;
     const fractalBreakDown = fractals.significantLow !== null && closes[i] < fractals.significantLow;
@@ -291,7 +326,7 @@ async function runScanMode() {
       else message += `⚠️ D1 data unavailable\n\n`;
       message += `⏰ Time (UTC): ${timeFormatted}`;
       await sendTelegram(message);
-      trades.push({ id: `${SYMBOL}-${isoTime}`, contractId: null, repo: REPO_LABEL, symbol: SYMBOL, direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry: h1Data.open, tp1Reached: false, macdEarlyFlipEpoch: null, lastInProfit: null, rr: RISK_REWARD, openTime: timeFormatted, closeTime: null, result: null });
+      trades.push({ id: `${SYMBOL}-${isoTime}`, contractId: null, repo: REPO_LABEL, symbol: SYMBOL, direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry: h1Data.open, tp1Reached: false, macdEarlyFlipEpoch: null, lastInProfit: null, peakProfit: null, rr: RISK_REWARD, openTime: timeFormatted, closeTime: null, result: null });
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       try { const contractId = await executeTrade(direction); if (contractId) { trades[trades.length-1].contractId = contractId; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2)); } } catch (execErr) { console.error("⚠️ Live execution warning:", execErr.message); }
       state.waitingFor = null; state.setupEpoch = null;
