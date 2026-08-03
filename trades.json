@@ -82,5 +82,26 @@
     "closeTime": "2026-08-03T04:15:16.680Z",
     "result": "LOSS",
     "pnlUSD": -2.12
+  },
+  {
+    "id": "1HZ75V-2026-08-03T07:50:00.000Z",
+    "contractId": 7812531919,
+    "repo": "Coffee Machine",
+    "symbol": "1HZ75V",
+    "direction": "SELL",
+    "entry": 7691.61,
+    "sl": 7894.52,
+    "tp1": 7387.244999999999,
+    "tp2": 7285.789999999998,
+    "tp3": 7082.879999999997,
+    "h1OpenAtEntry": 7750.95,
+    "tp1Reached": false,
+    "macdEarlyFlipEpoch": null,
+    "lastInProfit": null,
+    "peakProfit": null,
+    "rr": 1.5,
+    "openTime": "2026-08-03 07:50:00",
+    "closeTime": null,
+    "result": null
   }
 ]
