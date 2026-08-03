@@ -249,7 +249,28 @@ function calcUnrealizedPnL(direction, entry, currentPrice) {
     : (entry - currentPrice) / entry;
   return pct * STAKE_USD * MULTIPLIER;
 }
-function getFractals(candles) { let pool = []; for (let i = 2; i < candles.length-2; i++) { const h = parseFloat(candles[i].high); if (h > parseFloat(candles[i-1].high) && h > parseFloat(candles[i-2].high) && h > parseFloat(candles[i+1].high) && h > parseFloat(candles[i+2].high)) pool.push(h); const l = parseFloat(candles[i].low); if (l < parseFloat(candles[i-1].low) && l < parseFloat(candles[i-2].low) && l < parseFloat(candles[i+1].low) && l < parseFloat(candles[i+2].low)) pool.push(l); } const recent = pool.slice(-FRACTAL_LOOKBACK); return { significantHigh: recent.length > 0 ? Math.max(...recent) : null, significantLow: recent.length > 0 ? Math.min(...recent) : null }; }
+function getFractals(candles) {
+  const pool = [];
+  for (let i = 2; i < candles.length - 2; i++) {
+    const h = parseFloat(candles[i].high);
+    if (h > parseFloat(candles[i-1].high) && h > parseFloat(candles[i-2].high) &&
+        h > parseFloat(candles[i+1].high) && h > parseFloat(candles[i+2].high)) {
+      pool.push({ type: "high", value: h });
+    }
+    const l = parseFloat(candles[i].low);
+    if (l < parseFloat(candles[i-1].low) && l < parseFloat(candles[i-2].low) &&
+        l < parseFloat(candles[i+1].low) && l < parseFloat(candles[i+2].low)) {
+      pool.push({ type: "low", value: l });
+    }
+  }
+  const recent = pool.slice(-FRACTAL_LOOKBACK);
+  const highs = recent.filter(f => f.type === "high").map(f => f.value);
+  const lows  = recent.filter(f => f.type === "low").map(f => f.value);
+  return {
+    significantHigh: highs.length > 0 ? Math.max(...highs) : null,
+    significantLow:  lows.length  > 0 ? Math.min(...lows)  : null,
+  };
+}
 
 async function fetchH1Data() {
   try { const h1 = await fetchCandles(3600, 60); if (!h1 || h1.length < 50) return { ema50: null, open: null }; const closes = h1.map(c => parseFloat(c.close)); const emaArr = ema(closes, 50); return { ema50: emaArr[emaArr.length-1], open: parseFloat(h1[h1.length-1].open) }; } catch { return { ema50: null, open: null }; }
@@ -388,7 +409,7 @@ async function runScanMode() {
         }
       }
     }
-    // Step 3: M5 SMA(4)/SMA(34) cross — arms waitingFor only when H1 and M15 both agree
+    // Step 3: M5 SMA(2)/SMA(50) cross — arms waitingFor only when H1 and M15 both agree
     if (state.h1CrossDir && state.m15CrossDir && state.h1CrossDir === state.m15CrossDir) {
       if ((smaFast5[i-1] <= smaSlow5[i-1]) && (smaFast5[i] > smaSlow5[i]) && state.m15CrossDir === "BUY") { state.waitingFor = "BUY"; state.setupEpoch = currentCandleEpoch; }
       else if ((smaFast5[i-1] >= smaSlow5[i-1]) && (smaFast5[i] < smaSlow5[i]) && state.m15CrossDir === "SELL") { state.waitingFor = "SELL"; state.setupEpoch = currentCandleEpoch; }
