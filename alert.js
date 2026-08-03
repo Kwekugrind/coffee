@@ -5,8 +5,8 @@ import fs from "fs";
 // ==================== REPOSITORY CONFIGURATION ====================
 const SYMBOL = "1HZ75V";
 const TRADING_SYMBOL = "1HZ75V";
-const SYMBOL_NAME = "Volatility 75 Index (1s)";
-const REPO_LABEL = "Coffee Machine";
+const SYMBOL_NAME = "Volatility 75 (1s) Index";
+const REPO_LABEL = "Coffee (V75-1s Demo)";
 // ==================================================================
 
 const M5 = 300;
@@ -124,39 +124,28 @@ async function executeManualClose(result, reason) {
   console.log(`✅ Manual close complete: ${result}`);
 }
 
+let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1CrossDir: null, h1CrossEpoch: null, m15CrossDir: null, m15CrossEpoch: null };
+try { if (fs.existsSync("state.json")) state = { ...state, ...JSON.parse(fs.readFileSync("state.json")) }; } catch (e) { console.log("State load error, starting fresh."); }
 
 (async () => {
   if (MODE === "daily")   { await runSummary(1,  "Daily Report");   process.exit(0); }
   if (MODE === "weekly")  { await runSummary(7,  "Weekly Report");  process.exit(0); }
   if (MODE === "monthly") { await runSummary(30, "Monthly Report"); process.exit(0); }
   if (MODE === "test") {
-    console.log("🧪 TEST MODE: Firing a direct demo BUY trade via proxy...");
+    console.log("🧪 TEST MODE: Firing a direct BUY trade via proxy...");
     const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
     const tpDollars = parseFloat((slDollars * RISK_REWARD).toFixed(2));
     await sendTelegram(`🧪 *Test Trade Initiated*\nSymbol: ${SYMBOL_NAME}\nDirection: BUY\nStake: $${STAKE_USD} | Multiplier: ${MULTIPLIER}x\nSL: $${slDollars} (hard) | TP1: $${tpDollars} (soft) | Safety TP: $${SAFETY_TP_USD} (hard ceiling)`);
     try {
       const contractId = await executeTrade("BUY");
-      if (contractId) { await sendTelegram(`✅ *Test Trade Executed Successfully!*\nContract ID: \`${contractId}\`\nCheck your Deriv demo account to confirm the open position.`); }
+      if (contractId) { await sendTelegram(`✅ *Test Trade Executed Successfully!*\nContract ID: \`${contractId}\`\nCheck your Deriv account to confirm the open position.`); }
       else { await sendTelegram(`⚠️ *Test Trade Returned Null*\nCheck Actions logs for details.`); }
     } catch (err) { console.error("❌ Test trade error:", err.message); await sendTelegram(`❌ *Test Trade Failed*\nError: ${err.message}\n\nCheck Actions logs for full details.`); }
-    process.exit(0);
-  }
-  if (MODE === "close_win") {
-    await executeManualClose("WIN", "Manual Close — Profit taken");
-    fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
-    process.exit(0);
-  }
-  if (MODE === "close_loss") {
-    await executeManualClose("LOSS", "Manual Close — Loss accepted");
-    fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
     process.exit(0);
   }
   if (TRIGGER_SOURCE !== "cronjob") { console.log("⛔ Blocked: Not a cronjob trigger."); process.exit(0); }
   await runScanMode();
 })();
-
-let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1CrossDir: null, h1CrossEpoch: null, m15CrossDir: null, m15CrossEpoch: null };
-try { if (fs.existsSync("state.json")) state = { ...state, ...JSON.parse(fs.readFileSync("state.json")) }; } catch (e) { console.log("State load error, starting fresh."); }
 
 function openWS() { return new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${MARKET_DATA_APP_ID}`, { headers: { "Origin": "https://deriv.com" } }); }
 
@@ -214,10 +203,10 @@ async function executeTrade(direction) {
   if (!DERIV_TOKEN) { console.log("⚠️ DERIV_API_TOKEN not set. Skipping."); return null; }
   if (!DERIV_APP_ID) { console.log("⚠️ DERIV_APP_ID not set. Skipping."); return null; }
   if (!PROXY_URL || !PROXY_SECRET) { console.log("⚠️ PROXY_URL or PROXY_SECRET not set. Skipping."); return null; }
-  const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
   console.log(`🔄 Sending ${direction} trade via Cloudflare proxy...`);
   const accountId = await getDerivAccountId();
   const wsUrl = await getDerivOTP(accountId);
+  const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
   const params = { buy: "1", price: STAKE_USD, parameters: { contract_type: direction === "BUY" ? "MULTUP" : "MULTDOWN", underlying_symbol: TRADING_SYMBOL, currency: "USD", amount: STAKE_USD, basis: "stake", multiplier: MULTIPLIER, limit_order: { stop_loss: slDollars, take_profit: SAFETY_TP_USD } } };
   const response = await fetch(PROXY_URL, { method: "POST", headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET }, body: JSON.stringify({ wsUrl, action: "buy", params }) });
   const data = await response.json();
@@ -249,6 +238,12 @@ function calcUnrealizedPnL(direction, entry, currentPrice) {
     : (entry - currentPrice) / entry;
   return pct * STAKE_USD * MULTIPLIER;
 }
+
+// Collect all fractals (high and low) in chronological order, tagged by type.
+// Take the most recent FRACTAL_LOOKBACK fractals from that combined pool.
+// significantHigh = max of any HIGH fractals in those recent N.
+// significantLow  = min of any LOW  fractals in those recent N.
+// This prevents a run of all-low fractals from producing a fake significantHigh.
 function getFractals(candles) {
   const pool = [];
   for (let i = 2; i < candles.length - 2; i++) {
@@ -418,16 +413,15 @@ async function runScanMode() {
     const candleRange = highs[i] - lows[i];
     const closePosBuy = (closes[i] - lows[i]) / candleRange, closePosSell = (highs[i] - closes[i]) / candleRange;
     const fractals = getFractals(candles);
-    const fractalBreakUp = fractals.significantHigh !== null && closes[i] > fractals.significantHigh;
-    const fractalBreakDown = fractals.significantLow !== null && closes[i] < fractals.significantLow;
+    const fractalBreakUp   = fractals.significantHigh !== null && closes[i] > fractals.significantHigh;
+    const fractalBreakDown = fractals.significantLow  !== null && closes[i] < fractals.significantLow;
     const h1Data = await fetchH1Data();
-    const h1Ema50 = h1Data.ema50;
     const h4Candle = await fetchH4Candle();
     if (!h4Candle) { console.log("⚠️ H4 unavailable — skipping signal scan"); state.lastProcessedEpoch = currentCandleEpoch; fs.writeFileSync("state.json", JSON.stringify(state, null, 2)); return; }
     const h4Bullish = parseFloat(h4Candle.close) > parseFloat(h4Candle.open);
     const h4Bearish = parseFloat(h4Candle.close) < parseFloat(h4Candle.open);
-    const buySignal  = state.waitingFor === "BUY"  && h4Bullish && fractalBreakUp   && closePosBuy  >= 0.6 && closes[i] > opens[i] && (h1Ema50 === null || closes[i] > h1Ema50);
-    const sellSignal = state.waitingFor === "SELL" && h4Bearish && fractalBreakDown && closePosSell >= 0.6 && closes[i] < opens[i] && (h1Ema50 === null || closes[i] < h1Ema50);
+    const buySignal  = state.waitingFor === "BUY"  && h4Bullish && fractalBreakUp   && closePosBuy  >= 0.6 && closes[i] > opens[i];
+    const sellSignal = state.waitingFor === "SELL" && h4Bearish && fractalBreakDown && closePosSell >= 0.6 && closes[i] < opens[i];
     let signalTriggered = false, direction = "", entry, sl, risk, tp1, tp2, tp3;
     if (buySignal) { signalTriggered = true; direction = "BUY"; entry = closes[i]; sl = fractals.significantLow !== null ? Math.min(fractals.significantLow, entry-atr14*1.5) : entry-atr14*1.5; risk = entry-sl; tp1 = entry+risk*RISK_REWARD; tp2 = entry+risk*2; tp3 = entry+risk*3; }
     else if (sellSignal) { signalTriggered = true; direction = "SELL"; entry = closes[i]; sl = fractals.significantHigh !== null ? Math.max(fractals.significantHigh, entry+atr14*1.5) : entry+atr14*1.5; risk = sl-entry; tp1 = entry-risk*RISK_REWARD; tp2 = entry-risk*2; tp3 = entry-risk*3; }
@@ -436,12 +430,11 @@ async function runScanMode() {
       const d1 = await getD1Context();
       const alignment = d1 ? checkAlignment(direction, d1.direction) : "⚠️ D1 data unavailable";
       const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
-      const h1Line = h1Ema50 ? `H1 EMA50:  ${h1Ema50.toFixed(4)}  ✅ Trend aligned\n` : `H1 EMA50:  ⚠️ Data unavailable\n`;
       const h4Dir = h4Bullish ? "🟢 BULLISH" : "🔴 BEARISH";
-      let message = `🚨 ${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry:  ${entry.toFixed(4)}\n🛑 SL:     ${sl.toFixed(4)}\n🎯 TP1:    ${tp1.toFixed(4)}  → trail with MACD(8,100) after this\n🎯 TP2:    ${tp2.toFixed(4)}  (reference)\n🎯 TP3:    ${tp3.toFixed(4)}  (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | Soft TP1: $${tpDollars} | Safety: $${SAFETY_TP_USD}\n📊 Risk:   ${risk.toFixed(2)} points\n${h1Line}📈 H4:     ${h4Dir} ✅ Direction confirmed\n🔥 Setup:  Fractal break + H1 + H4 aligned\n━━━━━━━━━━━━━━━━━━━━\n📅 D1 CANDLE STATUS\n━━━━━━━━━━━━━━━━━━━━\n`;
+      let message = `🚨 ${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry:  ${entry.toFixed(4)}\n🛑 SL:     ${sl.toFixed(4)}\n🎯 TP1:    ${tp1.toFixed(4)}  → trail with MACD(8,100) after this\n🎯 TP2:    ${tp2.toFixed(4)}  (reference)\n🎯 TP3:    ${tp3.toFixed(4)}  (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | Soft TP1: $${tpDollars} | Safety: $${SAFETY_TP_USD}\n📊 Risk:   ${risk.toFixed(2)} points\n📈 H4:     ${h4Dir} ✅ Direction confirmed\n🔥 Setup:  Fractal break + H1 + H4 aligned\n━━━━━━━━━━━━━━━━━━━━\n📅 D1 CANDLE STATUS\n━━━━━━━━━━━━━━━━━━━━\n`;
       if (d1) message += `Direction:  ${d1.direction}\nD1 Open:    ${d1.open.toFixed(4)}\nD1 Current: ${d1.close.toFixed(4)}\nMovement:   ${d1.change.toFixed(4)} pts (${d1.changePct.toFixed(2)}%)\nAlignment:  ${alignment}\n\n`;
       else message += `⚠️ D1 data unavailable\n\n`;
-      message += `⏰ Time (UTC): ${timeFormatted}`;
+      message += `⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
       await sendTelegram(message);
       trades.push({ id: `${SYMBOL}-${isoTime}`, contractId: null, repo: REPO_LABEL, symbol: SYMBOL, direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry: h1Data.open, tp1Reached: false, macdEarlyFlipEpoch: null, lastInProfit: null, peakProfit: null, rr: RISK_REWARD, openTime: timeFormatted, closeTime: null, result: null });
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
