@@ -404,10 +404,12 @@ async function runScanMode() {
         }
       }
     }
-    // Step 3: M5 SMA(2)/SMA(50) cross — arms waitingFor only when H1 and M15 both agree
+    // Step 3: M5 SMA(2)/SMA(50) cross — arms waitingFor only when H1 and M15 both agree; counter-cross resets the setup
     if (state.h1CrossDir && state.m15CrossDir && state.h1CrossDir === state.m15CrossDir) {
       if ((smaFast5[i-1] <= smaSlow5[i-1]) && (smaFast5[i] > smaSlow5[i]) && state.m15CrossDir === "BUY") { state.waitingFor = "BUY"; state.setupEpoch = currentCandleEpoch; }
       else if ((smaFast5[i-1] >= smaSlow5[i-1]) && (smaFast5[i] < smaSlow5[i]) && state.m15CrossDir === "SELL") { state.waitingFor = "SELL"; state.setupEpoch = currentCandleEpoch; }
+      else if ((smaFast5[i-1] >= smaSlow5[i-1]) && (smaFast5[i] < smaSlow5[i]) && state.m15CrossDir === "BUY") { state.waitingFor = null; state.setupEpoch = null; }
+      else if ((smaFast5[i-1] <= smaSlow5[i-1]) && (smaFast5[i] > smaSlow5[i]) && state.m15CrossDir === "SELL") { state.waitingFor = null; state.setupEpoch = null; }
     }
     if (state.waitingFor && state.setupEpoch && (currentCandleEpoch - state.setupEpoch) > (SETUP_EXPIRY_BARS * M5)) { state.waitingFor = null; state.setupEpoch = null; }
     const candleRange = highs[i] - lows[i];
