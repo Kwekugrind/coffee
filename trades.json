@@ -96,7 +96,7 @@
     "tp3": 7082.879999999997,
     "h1OpenAtEntry": 7750.95,
     "tp1Reached": false,
-    "macdEarlyFlipEpoch": 1785748500,
+    "macdEarlyFlipEpoch": null,
     "lastInProfit": false,
     "peakProfit": null,
     "rr": 1.5,
