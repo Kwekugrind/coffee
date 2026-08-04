@@ -2,22 +2,24 @@ import WebSocket from "ws";
 import fetch from "node-fetch";
 import fs from "fs";
 
-const SYMBOL          = "1HZ75V";
-const TRADING_SYMBOL  = "1HZ75V";
-const SYMBOL_NAME     = "Volatility 75 (1s) Index";
-const REPO_LABEL      = "Coffee (V75-1s Demo)";
-const MULTIPLIER      = 50;
-const STAKE_USD       = 1;
-const RISK_REWARD     = 1.5;
-const SAFETY_TP_USD   = 0.5;
-const ATR_PERIOD      = 14;
-const SETUP_EXPIRY_BARS = 35;
-const APP_ID          = process.env.DERIV_APP_ID   || "67418";
-const TG_TOKEN        = process.env.TG_TOKEN;
-const TG_CHAT_ID      = process.env.TG_CHAT_ID;
-const DERIV_TOKEN     = process.env.DERIV_API_TOKEN;
-const MODE            = process.env.MODE            || "cronjob";
-const TRIGGER_SOURCE  = process.env.TRIGGER_SOURCE  || "manual";
+const SYMBOL             = "1HZ75V";
+const TRADING_SYMBOL     = "1HZ75V";
+const SYMBOL_NAME        = "Volatility 75 (1s) Index";
+const REPO_LABEL         = "Coffee (V75-1s Demo)";
+const MULTIPLIER         = 50;
+const STAKE_USD          = 1;
+const RISK_REWARD        = 1.5;
+const SAFETY_TP_USD      = 0.5;
+const TRAIL_ACTIVATE_USD = 0.30;
+const TRAIL_DROP_USD     = 0.15;
+const ATR_PERIOD         = 14;
+const SETUP_EXPIRY_BARS  = 35;
+const APP_ID         = process.env.DERIV_APP_ID   || "67418";
+const TG_TOKEN       = process.env.TG_TOKEN;
+const TG_CHAT_ID     = process.env.TG_CHAT_ID;
+const DERIV_TOKEN    = process.env.DERIV_API_TOKEN;
+const MODE           = process.env.MODE           || "cronjob";
+const TRIGGER_SOURCE = process.env.TRIGGER_SOURCE || "manual";
 const M5  = 5  * 60;
 const M15 = 15 * 60;
 const H1  = 60 * 60;
@@ -80,12 +82,9 @@ async function executeManualClose(result, reason) {
   if (!open.length) { await sendTelegram("No open trades to close."); return; }
   for (const trade of open) {
     const currentPrice = await getCurrentPrice(trade.symbol);
-    if (trade.contractId) {
-      try { await closeContract(trade.contractId); } catch (e) { console.error("Close error:", e.message); }
-    }
-    const closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
+    if (trade.contractId) { try { await closeContract(trade.contractId); } catch (e) { console.error("Close error:", e.message); } }
     const pnl = trade.direction === "BUY" ? currentPrice - trade.entry : trade.entry - currentPrice;
-    trade.result = result; trade.closeTime = closeTime;
+    trade.result = result; trade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
     await sendTelegram(`🔒 Manual close (${reason}): ${trade.direction} @ ${trade.entry} → ${currentPrice.toFixed(4)} | ${result} | PnL: ${pnl.toFixed(4)} pts`);
   }
   fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
@@ -131,8 +130,7 @@ async function fetchCandles(granularity, count = 100) {
     return new Promise((resolve, reject) => {
       ws.send(JSON.stringify({ ticks_history: SYMBOL, granularity, count, end: "latest", style: "candles" }));
       ws.on("message", d => {
-        const msg = JSON.parse(d);
-        ws.close();
+        const msg = JSON.parse(d); ws.close();
         if (msg.candles) resolve(msg.candles);
         else reject(new Error("No candles: " + JSON.stringify(msg)));
       });
@@ -147,8 +145,7 @@ async function getCurrentPrice(sym = SYMBOL) {
     return new Promise((resolve, reject) => {
       ws.send(JSON.stringify({ ticks: sym, subscribe: 0 }));
       ws.on("message", d => {
-        const msg = JSON.parse(d);
-        ws.close();
+        const msg = JSON.parse(d); ws.close();
         if (msg.tick) resolve(parseFloat(msg.tick.quote));
         else reject(new Error("No tick"));
       });
@@ -165,8 +162,7 @@ async function getDerivAccountId() {
       ws.on("message", d => {
         const msg = JSON.parse(d);
         if (msg.authorize) {
-          const accounts = msg.authorize.account_list || [];
-          const acc = accounts.find(a => a.account_type === "demo");
+          const acc = (msg.authorize.account_list || []).find(a => a.account_type === "demo");
           ws.close(); resolve(acc ? acc.loginid : null);
         } else { ws.close(); reject(new Error("Auth failed")); }
       });
@@ -177,7 +173,7 @@ async function getDerivAccountId() {
 
 async function executeTrade(direction) {
   return withRetry(async () => {
-    const loginid = await getDerivAccountId();
+    await getDerivAccountId();
     const ws = await openWS();
     return new Promise((resolve, reject) => {
       ws.send(JSON.stringify({ authorize: DERIV_TOKEN }));
@@ -185,10 +181,19 @@ async function executeTrade(direction) {
         const msg = JSON.parse(d);
         if (msg.authorize) {
           const contractType = direction === "BUY" ? "MULTUP" : "MULTDOWN";
-          ws.send(JSON.stringify({ buy: 1, price: STAKE_USD, parameters: { contract_type: contractType, symbol: TRADING_SYMBOL, multiplier: MULTIPLIER, basis: "stake", duration_unit: "s", limit_order: { stop_loss: { order_amount: STAKE_USD * 0.5, order_type: "stop_loss" } } } }));
+          ws.send(JSON.stringify({
+            buy: 1, price: STAKE_USD,
+            parameters: {
+              contract_type: contractType, symbol: TRADING_SYMBOL,
+              multiplier: MULTIPLIER, basis: "stake",
+              limit_order: {
+                stop_loss:   parseFloat((STAKE_USD * 0.5).toFixed(2)),
+                take_profit: parseFloat((STAKE_USD * 0.5 * RISK_REWARD).toFixed(2))
+              }
+            }
+          }));
         } else if (msg.buy) {
-          const contractId = msg.buy.contract_id;
-          ws.close(); resolve(contractId);
+          ws.close(); resolve(msg.buy.contract_id);
         } else if (msg.error) { ws.close(); reject(new Error(msg.error.message)); }
       });
       setTimeout(() => { ws.close(); reject(new Error("executeTrade timeout")); }, 20000);
@@ -203,11 +208,9 @@ async function closeContract(contractId) {
       ws.send(JSON.stringify({ authorize: DERIV_TOKEN }));
       ws.on("message", d => {
         const msg = JSON.parse(d);
-        if (msg.authorize) {
-          ws.send(JSON.stringify({ sell: contractId, price: 0 }));
-        } else if (msg.sell) {
-          ws.close(); resolve(msg.sell);
-        } else if (msg.error) { ws.close(); reject(new Error(msg.error.message)); }
+        if (msg.authorize) { ws.send(JSON.stringify({ sell: contractId, price: 0 })); }
+        else if (msg.sell) { ws.close(); resolve(msg.sell); }
+        else if (msg.error) { ws.close(); reject(new Error(msg.error.message)); }
       });
       setTimeout(() => { ws.close(); reject(new Error("closeContract timeout")); }, 20000);
     });
@@ -222,8 +225,7 @@ function sma(data, period) {
 }
 
 function ema(data, period) {
-  const k = 2 / (period + 1); const result = [];
-  let prev = null;
+  const k = 2 / (period + 1); const result = []; let prev = null;
   for (let i = 0; i < data.length; i++) {
     if (i < period - 1) { result.push(null); continue; }
     if (i === period - 1) { prev = data.slice(0, period).reduce((a,b)=>a+b,0)/period; result.push(prev); continue; }
@@ -249,8 +251,8 @@ function calcUnrealizedPnL(trade, currentPrice) {
 }
 
 function getFractals(candles) {
-  const lookback = Math.min(6, candles.length - 1);
-  const slice = candles.slice(-lookback - 1, -1);
+  const lookback = Math.min(6, candles.length - 2);
+  const slice = candles.slice(-lookback - 2, -2);
   let significantHigh = null, significantLow = null;
   for (const c of slice) {
     const h = parseFloat(c.high), l = parseFloat(c.low);
@@ -301,52 +303,62 @@ async function runScanMode() {
     const pnl = calcUnrealizedPnL(openTrade, currentPrice);
     dbg(`Open trade PnL: ${pnl.toFixed(4)}`);
 
-    if (pnl >= SAFETY_TP_USD && !openTrade.tp1Reached) {
-      openTrade.tp1Reached = true;
-      openTrade.macdEarlyFlipEpoch = null;
+    const closeWith = async (result, reason) => {
+      openTrade.result = result;
+      openTrade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
+      if (openTrade.contractId) { try { await closeContract(openTrade.contractId); } catch (e) { console.error("Close error:", e.message); } }
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-      await sendTelegram(`🎯 TP1 reached on ${openTrade.direction} trade! Trailing with MACD(8,100) now.`);
+      await sendTelegram(reason);
+    };
+
+    const slBreached = openTrade.direction === "BUY" ? currentPrice <= openTrade.sl : currentPrice >= openTrade.sl;
+    if (slBreached) { await closeWith("LOSS", `🛑 Hard SL hit | ${openTrade.direction} | Price: ${currentPrice.toFixed(4)} | SL: ${openTrade.sl.toFixed(4)} | PnL: ${pnl.toFixed(4)} pts`); return; }
+
+    if (pnl >= SAFETY_TP_USD) { await closeWith("WIN", `💰 Safety TP hit | ${openTrade.direction} | PnL: $${pnl.toFixed(2)}`); return; }
+
+    if (!openTrade.tp1Reached) {
+      const tp1Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1;
+      if (tp1Hit) { openTrade.tp1Reached = true; openTrade.macdEarlyFlipEpoch = null; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2)); await sendTelegram(`🎯 TP1 price level reached on ${openTrade.direction} — switching to MACD(8,100) trail.`); }
+    }
+
+    if (pnl >= TRAIL_ACTIVATE_USD) {
+      if (openTrade.peakProfit === null || pnl > openTrade.peakProfit) { openTrade.peakProfit = pnl; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2)); }
+      if (openTrade.peakProfit !== null && pnl < openTrade.peakProfit - TRAIL_DROP_USD) { const result = pnl >= 0 ? "WIN" : "LOSS"; await closeWith(result, `📉 High-water trail exit: ${result} | ${openTrade.direction} | Peak: $${openTrade.peakProfit.toFixed(2)} | Now: $${pnl.toFixed(2)}`); return; }
+    }
+
+    if (!openTrade.tp1Reached) {
+      const m5Early = await fetchCandles(M5, 60);
+      if (m5Early && m5Early.length >= 52) {
+        const cls = m5Early.map(c => parseFloat(c.close)), ci = m5Early.length - 2;
+        const sf = sma(cls, 2), ss = sma(cls, 50);
+        if (sf[ci] != null && ss[ci] != null) {
+          const m5Against = openTrade.direction === "BUY" ? sf[ci] < ss[ci] : sf[ci] > ss[ci];
+          if (m5Against) { const result = pnl >= 0 ? "WIN" : "LOSS"; await closeWith(result, `⚡ M5 reversal exit (pre-TP1): ${result} | ${openTrade.direction} | PnL: ${pnl.toFixed(4)} pts`); return; }
+        }
+      }
     }
 
     if (openTrade.tp1Reached) {
       const m5c = await fetchCandles(M5, 120);
       if (m5c && m5c.length >= 100) {
-        const cls = m5c.map(c => parseFloat(c.close));
+        const cls = m5c.map(c => parseFloat(c.close)), ci = m5c.length - 2;
         const macdFast = ema(cls, 8), macdSlow = ema(cls, 100);
-        const ci = m5c.length - 2;
         const macdVal = (macdFast[ci] != null && macdSlow[ci] != null) ? macdFast[ci] - macdSlow[ci] : null;
         if (macdVal !== null) {
-          const bearFlip = openTrade.direction === "BUY"  && macdVal < 0;
-          const bullFlip = openTrade.direction === "SELL" && macdVal > 0;
-          if (bearFlip || bullFlip) {
-            if (!openTrade.macdEarlyFlipEpoch) {
-              openTrade.macdEarlyFlipEpoch = m5c[ci].epoch;
-              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-            } else if (m5c[ci].epoch > openTrade.macdEarlyFlipEpoch) {
-              const result = pnl >= 0 ? "WIN" : "LOSS";
-              openTrade.result = result; openTrade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
-              if (openTrade.contractId) { try { await closeContract(openTrade.contractId); } catch (e) { console.error("Close error:", e.message); } }
-              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-              await sendTelegram(`🏁 MACD trail exit: ${result} | ${openTrade.direction} | PnL: ${pnl.toFixed(4)} pts`);
-              return;
-            }
+          const flip = openTrade.direction === "BUY" ? macdVal < 0 : macdVal > 0;
+          if (flip) {
+            if (!openTrade.macdEarlyFlipEpoch) { openTrade.macdEarlyFlipEpoch = m5c[ci].epoch; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2)); }
+            else if (m5c[ci].epoch > openTrade.macdEarlyFlipEpoch) { const result = pnl >= 0 ? "WIN" : "LOSS"; await closeWith(result, `🏁 MACD trail exit: ${result} | ${openTrade.direction} | PnL: ${pnl.toFixed(4)} pts`); return; }
           } else { openTrade.macdEarlyFlipEpoch = null; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2)); }
         }
       }
     }
 
     if (openTrade.h1OpenAtEntry != null) {
-      const stopBreach = openTrade.direction === "BUY"  ? currentPrice < openTrade.h1OpenAtEntry
-                                                        : currentPrice > openTrade.h1OpenAtEntry;
-      if (stopBreach) {
-        const result = pnl >= 0 ? "WIN" : "LOSS";
-        openTrade.result = result; openTrade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
-        if (openTrade.contractId) { try { await closeContract(openTrade.contractId); } catch (e) { console.error("Close error:", e.message); } }
-        fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-        await sendTelegram(`🛑 H1-open breach exit: ${result} | ${openTrade.direction} | Price: ${currentPrice.toFixed(4)} | H1 Open: ${openTrade.h1OpenAtEntry.toFixed(4)} | PnL: ${pnl.toFixed(4)} pts`);
-        return;
-      }
+      const h1Breach = openTrade.direction === "BUY" ? currentPrice < openTrade.h1OpenAtEntry : currentPrice > openTrade.h1OpenAtEntry;
+      if (h1Breach) { const result = pnl >= 0 ? "WIN" : "LOSS"; await closeWith(result, `🛑 H1-open breach exit: ${result} | ${openTrade.direction} | Price: ${currentPrice.toFixed(4)} | H1 Open: ${openTrade.h1OpenAtEntry.toFixed(4)} | PnL: ${pnl.toFixed(4)} pts`); return; }
     }
+
     console.log("Open trade being managed — skipping scan.");
     return;
   }
@@ -357,22 +369,19 @@ async function runScanMode() {
   const i = candles.length - 2;
   const currentCandleEpoch = candles[i].epoch;
   const closes = candles.map(c => parseFloat(c.close));
-
   if (state.lastProcessedEpoch === currentCandleEpoch) { console.log("Already processed this candle — skipping."); return; }
 
   const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
   const opens = candles.map(c => parseFloat(c.open));
   const highs = candles.map(c => parseFloat(c.high));
   const lows  = candles.map(c => parseFloat(c.low));
-  const smaFast5 = sma(closes, 2);
-  const smaSlow5 = sma(closes, 50);
-  const atr14    = calculateATR(candles, ATR_PERIOD);
+  const smaFast5 = sma(closes, 2), smaSlow5 = sma(closes, 50);
+  const atr14 = calculateATR(candles, ATR_PERIOD);
 
   const h1Candles = await fetchCandles(H1, 100);
   let h1Dir = null, h1OpenAtEntry = null;
   if (h1Candles && h1Candles.length >= 52) {
-    const h1Closes = h1Candles.map(c => parseFloat(c.close));
-    const h1ci = h1Candles.length - 2;
+    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 2;
     const smaFast1h = sma(h1Closes, 2), smaSlow1h = sma(h1Closes, 50);
     if (smaFast1h[h1ci] != null && smaSlow1h[h1ci] != null) {
       if      (smaFast1h[h1ci] > smaSlow1h[h1ci]) h1Dir = "BUY";
@@ -384,8 +393,7 @@ async function runScanMode() {
   const m15Candles = await fetchCandles(M15, 100);
   let m15Dir = null;
   if (m15Candles && m15Candles.length >= 52) {
-    const m15Closes = m15Candles.map(c => parseFloat(c.close));
-    const m15ci = m15Candles.length - 2;
+    const m15Closes = m15Candles.map(c => parseFloat(c.close)), m15ci = m15Candles.length - 2;
     const smaFast15 = sma(m15Closes, 2), smaSlow15 = sma(m15Closes, 50);
     if (smaFast15[m15ci] != null && smaSlow15[m15ci] != null) {
       if      (smaFast15[m15ci] > smaSlow15[m15ci]) m15Dir = "BUY";
@@ -403,24 +411,13 @@ async function runScanMode() {
 
   const aligned = h1Dir && m15Dir && m5Dir && h1Dir === m15Dir && m15Dir === m5Dir;
   if (aligned) {
-    if (state.waitingFor !== h1Dir) {
-      state.waitingFor  = h1Dir;
-      state.setupEpoch  = currentCandleEpoch;
-      console.log(`Alignment detected: ${h1Dir} — setup clock started.`);
-    } else {
-      console.log(`Alignment continues: ${h1Dir} — setup clock preserved.`);
-    }
+    if (state.waitingFor !== h1Dir) { state.waitingFor = h1Dir; state.setupEpoch = currentCandleEpoch; console.log(`Alignment detected: ${h1Dir} — setup clock started.`); }
+    else { console.log(`Alignment continues: ${h1Dir} — setup clock preserved.`); }
   } else {
     if (state.waitingFor) console.log(`Alignment broken (H1:${h1Dir} M15:${m15Dir} M5:${m5Dir}) — clearing setup.`);
-    state.waitingFor = null;
-    state.setupEpoch = null;
+    state.waitingFor = null; state.setupEpoch = null;
   }
-
-  if (state.waitingFor && state.setupEpoch && (currentCandleEpoch - state.setupEpoch) > (SETUP_EXPIRY_BARS * M5)) {
-    console.log("Setup expired — clearing.");
-    state.waitingFor = null;
-    state.setupEpoch = null;
-  }
+  if (state.waitingFor && state.setupEpoch && (currentCandleEpoch - state.setupEpoch) > (SETUP_EXPIRY_BARS * M5)) { console.log("Setup expired — clearing."); state.waitingFor = null; state.setupEpoch = null; }
 
   const candleRange = highs[i] - lows[i];
   if (candleRange === 0) { state.lastProcessedEpoch = currentCandleEpoch; fs.writeFileSync("state.json", JSON.stringify(state, null, 2)); return; }
@@ -432,12 +429,7 @@ async function runScanMode() {
   const fractalBreakDown = fractals.significantLow  !== null && closes[i] < fractals.significantLow;
 
   const h4Candle = await fetchH4Candle();
-  if (!h4Candle) {
-    console.log("⚠️ H4 unavailable — skipping signal scan.");
-    state.lastProcessedEpoch = currentCandleEpoch;
-    fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
-    return;
-  }
+  if (!h4Candle) { console.log("⚠️ H4 unavailable — skipping signal scan."); state.lastProcessedEpoch = currentCandleEpoch; fs.writeFileSync("state.json", JSON.stringify(state, null, 2)); return; }
   const h4Bullish = parseFloat(h4Candle.close) > parseFloat(h4Candle.open);
   const h4Bearish = parseFloat(h4Candle.close) < parseFloat(h4Candle.open);
 
@@ -447,11 +439,11 @@ async function runScanMode() {
   let signalTriggered = false, direction = "", entry, sl, risk, tp1, tp2, tp3;
   if (buySignal) {
     signalTriggered = true; direction = "BUY"; entry = closes[i];
-    sl   = fractals.significantLow  !== null ? Math.min(fractals.significantLow,  entry - atr14 * 1.5) : entry - atr14 * 1.5;
+    sl = fractals.significantLow !== null ? Math.min(fractals.significantLow, entry - atr14 * 1.5) : entry - atr14 * 1.5;
     risk = entry - sl; tp1 = entry + risk * RISK_REWARD; tp2 = entry + risk * 2; tp3 = entry + risk * 3;
   } else if (sellSignal) {
     signalTriggered = true; direction = "SELL"; entry = closes[i];
-    sl   = fractals.significantHigh !== null ? Math.max(fractals.significantHigh, entry + atr14 * 1.5) : entry + atr14 * 1.5;
+    sl = fractals.significantHigh !== null ? Math.max(fractals.significantHigh, entry + atr14 * 1.5) : entry + atr14 * 1.5;
     risk = sl - entry; tp1 = entry - risk * RISK_REWARD; tp2 = entry - risk * 2; tp3 = entry - risk * 3;
   }
 
@@ -462,14 +454,12 @@ async function runScanMode() {
     const alignment = d1 ? checkAlignment(direction, d1.direction) : "⚠️ D1 data unavailable";
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const h4Dir = h4Bullish ? "🟢 BULLISH" : "🔴 BEARISH";
-
     let message = `🚨 ${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry:  ${entry.toFixed(4)}\n🛑 SL:     ${sl.toFixed(4)}\n🎯 TP1:    ${tp1.toFixed(4)}  → trail with MACD(8,100) after this\n🎯 TP2:    ${tp2.toFixed(4)}  (reference)\n🎯 TP3:    ${tp3.toFixed(4)}  (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | Soft TP1: $${tpDollars} | Safety: $${SAFETY_TP_USD}\n📊 Risk:   ${risk.toFixed(2)} points\n📈 H4:     ${h4Dir} ✅ Direction confirmed\n🔥 Setup:  Fractal break + H1/M15/M5 aligned\n━━━━━━━━━━━━━━━━━━━━\n📅 D1 CANDLE STATUS\n━━━━━━━━━━━━━━━━━━━━\n`;
     if (d1) message += `Direction:  ${d1.direction}\nD1 Open:    ${d1.open.toFixed(4)}\nD1 Current: ${d1.close.toFixed(4)}\nMovement:   ${d1.change.toFixed(4)} pts (${d1.changePct.toFixed(2)}%)\nAlignment:  ${alignment}\n\n`;
     else     message += `⚠️ D1 data unavailable\n\n`;
     message += `⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
-
     await sendTelegram(message);
-    trades.push({ id: `${SYMBOL}-${isoTime}`, contractId: null, repo: REPO_LABEL, symbol: SYMBOL, direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry, tp1Reached: false, macdEarlyFlipEpoch: null, lastInProfit: null, peakProfit: null, rr: RISK_REWARD, openTime: timeFormatted, closeTime: null, result: null });
+    trades.push({ id: `${SYMBOL}-${isoTime}`, contractId: null, repo: REPO_LABEL, symbol: SYMBOL, direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry, tp1Reached: false, macdEarlyFlipEpoch: null, peakProfit: null, rr: RISK_REWARD, openTime: timeFormatted, closeTime: null, result: null });
     fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
     try { const contractId = await executeTrade(direction); if (contractId) { trades[trades.length-1].contractId = contractId; fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2)); } } catch (execErr) { console.error("⚠️ Live execution warning:", execErr.message); }
     state.waitingFor = null; state.setupEpoch = null;
