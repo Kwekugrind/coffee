@@ -1,8 +1,10 @@
 {
   "waitingFor": null,
   "setupEpoch": null,
-  "lastProcessedEpoch": 1786059900,
+  "lastProcessedEpoch": 1786060200,
   "lastTgUpdateId": 0,
+  "h1TrendDir": "BUY",
+  "firstTradeTaken": false,
   "h1CrossDir": "BUY",
   "h1CrossEpoch": 1785823200,
   "m15CrossDir": null,
