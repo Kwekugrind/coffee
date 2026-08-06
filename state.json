@@ -1,7 +1,7 @@
 {
-  "waitingFor": null,
-  "setupEpoch": null,
-  "lastProcessedEpoch": 1786002300,
+  "waitingFor": "SELL",
+  "setupEpoch": 1786002600,
+  "lastProcessedEpoch": 1786002600,
   "lastTgUpdateId": 0,
   "h1CrossDir": "BUY",
   "h1CrossEpoch": 1785823200,
