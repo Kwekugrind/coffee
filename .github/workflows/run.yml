@@ -14,7 +14,7 @@ on:
 
 concurrency:
   group: signal-bot-execution
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -55,5 +55,5 @@ jobs:
           git add state.json trades.json
           git diff --cached --quiet && echo "No changes" && exit 0
           git commit -m "Auto update bot state and trade logs"
-          git pull --rebase origin main   # ← ADD THIS
+          git pull --rebase origin main
           git push origin HEAD:main
