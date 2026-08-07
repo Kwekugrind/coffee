@@ -232,17 +232,18 @@
     "symbol": "1HZ75V",
     "direction": "BUY",
     "entry": 7987.17,
-    "sl": 7945.433571428572,
+    "sl": 7987.17,
     "tp1": 8049.774642857143,
     "tp2": 8070.642857142857,
     "tp3": 8112.379285714285,
     "h1OpenAtEntry": 7989.13,
-    "tp1Reached": false,
+    "tp1Reached": true,
     "macdEarlyFlipEpoch": null,
     "peakProfit": null,
     "rr": 1.5,
     "openTime": "2026-08-07 05:55:00",
     "closeTime": null,
-    "result": null
+    "result": null,
+    "breakevenSet": true
   }
 ]
