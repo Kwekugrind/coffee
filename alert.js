@@ -122,7 +122,7 @@ async function executeManualClose(result, reason) {
   }
 }
 
-let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, trendTradeCount: 0 };
+let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, phaseATriggeredEpoch: null, activeEntryType: null };
 try {
   const s = JSON.parse(fs.readFileSync("state.json"));
   state = {
@@ -131,7 +131,8 @@ try {
     waitingFor: s.waitingFor ?? null,
     setupEpoch: s.setupEpoch ?? null,
     h1TrendEpoch: s.h1TrendEpoch ?? null,
-    trendTradeCount: s.trendTradeCount ?? 0
+    phaseATriggeredEpoch: s.phaseATriggeredEpoch ?? null,
+    activeEntryType: s.activeEntryType ?? null
   };
 } catch {}
 
@@ -457,7 +458,7 @@ async function runScanMode() {
     return;
   }
 
-  // ── Signal Scan (New Indicators & State Machine) ──
+  // ── Signal Scan (Phase A vs Phase B State Machine) ──
   const candles = await fetchCandles(M5, 120);
   if (!candles || candles.length < 60) { console.log("Not enough M5 candles."); return; }
   const i = candles.length - 2;
@@ -472,7 +473,7 @@ async function runScanMode() {
   const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
   const cci = calculateCCI(candles, 34);
 
-  // Evaluate H1 Trend Direction (SMA 2 / 50)
+  // Evaluate H1 Trend Direction & Fresh Cross
   const h1Candles = await fetchCandles(H1, 100);
   let h1Dir = null, h1Epoch = null, h1FreshCross = false;
   if (h1Candles && h1Candles.length >= 52) {
@@ -511,44 +512,57 @@ async function runScanMode() {
     else if (m5SignalVal < 0) m5Dir = "SELL";
   }
 
-  // Track H1 Epoch & Trend State Machine
-  if (state.h1TrendEpoch !== h1Epoch || h1FreshCross) {
+  // Reset phase tracking if a new H1 epoch emerges
+  if (state.h1TrendEpoch !== h1Epoch) {
     state.h1TrendEpoch = h1Epoch;
-    state.trendTradeCount = 0;
-    state.waitingFor = null;
-    state.setupEpoch = null;
-    console.log(`New H1 Trend Epoch detected (${h1Dir}) — Reset trend trade count.`);
   }
 
-  // Alignment & Arming Logic
+  // Alignment & Arming Logic (Phase A vs Phase B)
   const h1m15Aligned = h1Dir && m15Dir && h1Dir === m15Dir;
   if (h1m15Aligned) {
     let m5Ready = false;
-    if (state.trendTradeCount === 0) {
-      // Phase 1: First Trade (State-based M5 agreement + CCI state check)
-      if (h1Dir === "BUY") {
-        m5Ready = (m5Dir === "BUY" && cci[i] > -114.4);
-      } else {
-        m5Ready = (m5Dir === "SELL" && cci[i] < 90);
+    let entryType = null;
+
+    // ── PHASE A: LIVE FRESH H1 CROSS ─────────────────────────────────────
+    if (h1FreshCross && state.phaseATriggeredEpoch !== h1Epoch) {
+      if (m5Dir === h1Dir) {
+        if (h1Dir === "BUY" && cci[i] > -114.4) {
+          m5Ready = true;
+          entryType = 'PHASE_A';
+        } else if (h1Dir === "SELL" && cci[i] < 90) {
+          m5Ready = true;
+          entryType = 'PHASE_A';
+        }
       }
-    } else {
-      // Phase 2: Subsequent Pullback Trades (M5 MACD agrees + M5 CCI cross pullback)
+    }
+
+    // ── PHASE B: ESTABLISHED TREND PULLBACKS ─────────────────────────────
+    if (!m5Ready) {
       const cciCrossBuy = (cci[i-1] <= -114.4) && (cci[i] > -114.4);
       const cciCrossSell = (cci[i-1] >= 90) && (cci[i] < 90);
-      if (h1Dir === "BUY" && m5SignalVal > 0 && cciCrossBuy) m5Ready = true;
-      if (h1Dir === "SELL" && m5SignalVal < 0 && cciCrossSell) m5Ready = true;
+
+      if (h1Dir === "BUY" && m5SignalVal > 0 && cciCrossBuy) {
+        m5Ready = true;
+        entryType = 'PHASE_B';
+      }
+      if (h1Dir === "SELL" && m5SignalVal < 0 && cciCrossSell) {
+        m5Ready = true;
+        entryType = 'PHASE_B';
+      }
     }
 
     if (m5Ready) {
-      if (state.waitingFor !== h1Dir) {
+      if (state.waitingFor !== h1Dir || state.activeEntryType !== entryType) {
         state.waitingFor = h1Dir;
+        state.activeEntryType = entryType;
         state.setupEpoch = currentCandleEpoch;
-        console.log(`Setup armed for ${h1Dir} (Trade #${state.trendTradeCount})`);
+        console.log(`Setup armed for ${h1Dir} via ${entryType}`);
       }
     }
   } else {
     state.waitingFor = null;
     state.setupEpoch = null;
+    state.activeEntryType = null;
   }
 
   // Setup Expiry Check
@@ -589,7 +603,7 @@ async function runScanMode() {
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const h4Dir = h4Bullish ? "🟢 BULLISH" : "🔴 BEARISH";
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} ($7.00 soft) → trail with CCI zero-cross\n🎯 TP2: ${tp2.toFixed(4)} (reference)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | TP1: $7.00 | Safety: $${SAFETY_TP_USD}\n📊 Risk: ${risk.toFixed(2)} points\n️ H4: ${h4Dir} ✅ Direction confirmed\n⚡ Setup: H1 SMA + M15 MACD + M5 CCI\n━━━━━━━━━━━━━━━━━━━━\n🌍 *D1 CANDLE STATUS*\n━━━━━━━━━━━━━━━━━━━━\n`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} ($7.00 soft) → trail with CCI zero-cross\n🎯 TP2: ${tp2.toFixed(4)} (reference)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | TP1: $7.00 | Safety: $${SAFETY_TP_USD}\n📊 Risk: ${risk.toFixed(2)} points\n️ H4: ${h4Dir} ✅ Direction confirmed\n⚡ Setup: H1 SMA + M15 MACD + M5 CCI (${state.activeEntryType})\n━━━━━━━━━━━━━━━━━━━━\n🌍 *D1 CANDLE STATUS*\n━━━━━━━━━━━━━━━━━━━━\n`;
     if (d1Ctx) message += `Direction: ${d1Ctx.direction}\nD1 Open: ${d1Ctx.open.toFixed(4)}\nD1 Current: ${d1Ctx.close.toFixed(4)}\nMovement: ${d1Ctx.change.toFixed(4)} pts (${d1Ctx.changePct.toFixed(2)}%)\nAlignment: ${alignment}\n\n`;
     else message += `⚠️ D1 data unavailable\n\n`;
     message += `⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
@@ -614,9 +628,12 @@ async function runScanMode() {
       console.error("⚠️ Live execution warning:", execErr.message);
     }
 
-    state.trendTradeCount++;
+    if (state.activeEntryType === 'PHASE_A') {
+      state.phaseATriggeredEpoch = h1Epoch; // Lock Phase A so it only triggers once per fresh H1 cross
+    }
     state.waitingFor = null;
     state.setupEpoch = null;
+    state.activeEntryType = null;
   }
 
   state.lastProcessedEpoch = currentCandleEpoch;
