@@ -3,6 +3,8 @@
   "setupEpoch": null,
   "lastProcessedEpoch": 1786134600,
   "lastTgUpdateId": 0,
+  "h1TrendEpoch": null,
+  "trendTradeCount": 0,
   "h1TrendDir": "SELL",
   "firstTradeTaken": true
 }
