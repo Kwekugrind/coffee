@@ -283,7 +283,7 @@
     "peakProfit": null,
     "rr": 1.5,
     "openTime": "2026-08-07 16:00:00",
-    "closeTime": null,
-    "result": null
+    "closeTime": "2026-08-07 16:20:19",
+    "result": "LOSS"
   }
 ]
