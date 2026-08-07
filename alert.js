@@ -3,28 +3,30 @@ import fetch from "node-fetch";
 import fs from "fs";
 
 // ==================== REPOSITORY CONFIGURATION (V75-1S DEMO) ====================
-const SYMBOL             = "1HZ75V";
-const TRADING_SYMBOL     = "1HZ75V";
-const SYMBOL_NAME        = "Volatility 75 (1s) Index";
-const REPO_LABEL         = "Coffee (V75-1s Demo)";
-const MULTIPLIER         = 50;
-const STAKE_USD          = 10;
-const RISK_REWARD        = 1.5;
-const SAFETY_TP_USD      = 15;   // Hard dollar ceiling — close immediately
-const TRAIL_ACTIVATE_USD = 5;    // Start high-water-mark trailing at this profit
-const TRAIL_DROP_USD     = 3;    // Exit if profit drops this much from peak
-const ATR_PERIOD         = 14;
-const FRACTAL_LOOKBACK   = 6;
-const SETUP_EXPIRY_BARS  = 35;
-const MARKET_DATA_APP_ID = "1089";
-const DERIV_APP_ID       = process.env.DERIV_APP_ID;
-const TG_TOKEN           = process.env.TG_BOT_TOKEN || process.env.TG_TOKEN;
-const TG_CHAT_ID         = process.env.TG_CHAT_ID;
-const DERIV_TOKEN        = process.env.DERIV_API_TOKEN;
-const PROXY_URL          = process.env.PROXY_URL;
-const PROXY_SECRET       = process.env.PROXY_SECRET;
-const MODE               = process.env.MODE           || "cronjob";
-const TRIGGER_SOURCE     = process.env.TRIGGER_SOURCE || "manual";
+const SYMBOL               = "1HZ75V";
+const TRADING_SYMBOL       = "1HZ75V";
+const SYMBOL_NAME          = "Volatility 75 (1s) Index";
+const REPO_LABEL           = "Coffee (V75-1s Demo)";
+const MULTIPLIER           = 50;
+const STAKE_USD            = 10;
+const RISK_REWARD          = 1.5;
+const SAFETY_TP_USD        = 15;   // Hard dollar ceiling — close immediately
+const TRAIL_ACTIVATE_USD   = 5;    // Start high-water-mark trailing at this profit
+const TRAIL_DROP_USD       = 3;    // Exit if profit drops this much from peak
+const BREAKEVEN_ACTIVATE_USD = 3.00; // Move SL to entry once profit hits this amount
+const COMMISSION_USD       = 0.15; // $0.16 for Live trades | $0.15 for Demo trades
+const ATR_PERIOD           = 14;
+const FRACTAL_LOOKBACK     = 6;
+const SETUP_EXPIRY_BARS    = 35;
+const MARKET_DATA_APP_ID   = "1089";
+const DERIV_APP_ID         = process.env.DERIV_APP_ID;
+const TG_TOKEN             = process.env.TG_BOT_TOKEN || process.env.TG_TOKEN;
+const TG_CHAT_ID           = process.env.TG_CHAT_ID;
+const DERIV_TOKEN          = process.env.DERIV_API_TOKEN;
+const PROXY_URL            = process.env.PROXY_URL;
+const PROXY_SECRET         = process.env.PROXY_SECRET;
+const MODE                 = process.env.MODE           || "cronjob";
+const TRIGGER_SOURCE       = process.env.TRIGGER_SOURCE || "manual";
 
 const M5  = 5  * 60;
 const M15 = 15 * 60;
@@ -114,11 +116,14 @@ async function executeManualClose(result, reason) {
     const durationMs = new Date(trade.closeTime) - new Date(trade.openTime);
     const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
     const tpDollars = parseFloat((slDollars * RISK_REWARD).toFixed(2));
-    const pnl = trade.direction === "BUY" ? (currentPrice - trade.entry) / trade.entry * STAKE_USD * MULTIPLIER : (trade.entry - currentPrice) / trade.entry * STAKE_USD * MULTIPLIER;
+    
+    const rawPnl = trade.direction === "BUY" ? (currentPrice - trade.entry) / trade.entry * STAKE_USD * MULTIPLIER : (trade.entry - currentPrice) / trade.entry * STAKE_USD * MULTIPLIER;
+    const pnl = rawPnl - COMMISSION_USD;
+    
     const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
     const tp1Status = trade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
     
-    await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${trade.direction} (${contractType})\nSymbol:    ${SYMBOL_NAME}\n\n📍 Entry:  ${trade.entry.toFixed(4)}\n🏁 Exit:   ${currentPrice.toFixed(4)}\n🛑 SL:     ${trade.sl.toFixed(4)}  ($${slDollars} hard)\n🎯 TP1:    ${trade.tp1.toFixed(4)}  ($${tpDollars} soft)  ${tp1Status}\n\n💵 P&L: ${pnlStr}\nReason: ${reason}\nDuration: ${formatDuration(durationMs)}\n\nOpened:  ${trade.openTime}\nClosed:  ${trade.closeTime}\n` + (trade.contractId ? `Contract: \`${trade.contractId}\`` : ""));
+    await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${trade.direction} (${contractType})\nSymbol:    ${SYMBOL_NAME}\n\n📍 Entry:  ${trade.entry.toFixed(4)}\n🏁 Exit:   ${currentPrice.toFixed(4)}\n🛑 SL:     ${trade.sl.toFixed(4)}  ($${slDollars} hard)\n🎯 TP1:    ${trade.tp1.toFixed(4)}  ($${tpDollars} soft)  ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${reason}\nDuration: ${formatDuration(durationMs)}\n\nOpened:  ${trade.openTime}\nClosed:  ${trade.closeTime}\n` + (trade.contractId ? `Contract: \`${trade.contractId}\`` : ""));
   }
 }
 
@@ -296,9 +301,8 @@ function calculateATR(candles, period) {
 }
 
 function calcUnrealizedPnL(trade, currentPrice) {
-  if (trade.direction === "BUY") return (currentPrice - trade.entry) / trade.entry * STAKE_USD * MULTIPLIER;
-  if (trade.direction === "SELL") return (trade.entry - currentPrice) / trade.entry * STAKE_USD * MULTIPLIER;
-  return 0;
+  const rawPnl = trade.direction === "BUY" ? (currentPrice - trade.entry) / trade.entry * STAKE_USD * MULTIPLIER : (trade.entry - currentPrice) / trade.entry * STAKE_USD * MULTIPLIER;
+  return rawPnl - COMMISSION_USD;
 }
 
 async function fetchH4Candle() {
@@ -362,8 +366,16 @@ async function runScanMode() {
       const tp1Status = openTrade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
       const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
       
-      await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol:    ${SYMBOL_NAME}\n\n📍 Entry:  ${openTrade.entry.toFixed(4)}\n🏁 Exit:   ${currentPrice.toFixed(4)}\n🛑 SL:     ${openTrade.sl.toFixed(4)}  ($${slDollars} hard)\n🎯 TP1:    ${openTrade.tp1.toFixed(4)}  ($${tpDollars} soft)  ${tp1Status}\n\n💵 P&L: ${pnlStr}\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened:  ${openTrade.openTime}\nClosed:  ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
+      await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol:    ${SYMBOL_NAME}\n\n📍 Entry:  ${openTrade.entry.toFixed(4)}\n🏁 Exit:   ${currentPrice.toFixed(4)}\n🛑 SL:     ${openTrade.sl.toFixed(4)}  ($${slDollars} hard)\n🎯 TP1:    ${openTrade.tp1.toFixed(4)}  ($${tpDollars} soft)  ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened:  ${openTrade.openTime}\nClosed:  ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
     };
+
+    // BREAKEVEN PROTECTION: Move SL to entry once profit hits $3.00 (before TP1)
+    if (!openTrade.tp1Reached && !openTrade.breakevenSet && pnl >= BREAKEVEN_ACTIVATE_USD) {
+      openTrade.sl = openTrade.entry;
+      openTrade.breakevenSet = true;
+      fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+      await sendTelegram(`🛡️ *${REPO_LABEL} — Breakeven Protected*\nProfit reached $${BREAKEVEN_ACTIVATE_USD.toFixed(2)}. Stop loss moved to entry (${openTrade.entry.toFixed(4)}).`);
+    }
 
     // 1. Hard SL Price Check
     const slBreached = openTrade.direction === "BUY" ? currentPrice <= openTrade.sl : currentPrice >= openTrade.sl;
@@ -403,22 +415,7 @@ async function runScanMode() {
       }
     }
 
-    // 5. Pre-TP1 Exit: M5 SMA(2)/SMA(50) turns against direction
-    if (!openTrade.tp1Reached) {
-      const m5Early = await fetchCandles(M5, 60);
-      if (m5Early && m5Early.length >= 52) {
-        const cls = m5Early.map(c => parseFloat(c.close)), ci = m5Early.length - 2;
-        const sf = sma(cls, 2), ss = sma(cls, 50);
-        if (sf[ci] != null && ss[ci] != null) {
-          const m5Against = openTrade.direction === "BUY" ? sf[ci] < ss[ci] : sf[ci] > ss[ci];
-          if (m5Against) {
-            const result = pnl >= 0 ? "WIN" : "LOSS";
-            await closeWith(result, `M5 SMA reversal exit (pre-TP1) — ${openTrade.direction} momentum lost`);
-            return;
-          }
-        }
-      }
-    }
+    // (Pre-TP1 M5 SMA Reversal Exit removed per Option A)
 
     // 6. Post-TP1 Exit: MACD(8,100) Trailing Exit
     if (openTrade.tp1Reached) {
@@ -443,16 +440,6 @@ async function runScanMode() {
             fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
           }
         }
-      }
-    }
-
-    // 7. H1-Open Hard Stop Breach
-    if (openTrade.h1OpenAtEntry != null) {
-      const h1Breach = openTrade.direction === "BUY" ? currentPrice < openTrade.h1OpenAtEntry : currentPrice > openTrade.h1OpenAtEntry;
-      if (h1Breach) {
-        const result = pnl >= 0 ? "WIN" : "LOSS";
-        await closeWith(result, `H1 open breach — price ${currentPrice.toFixed(4)} crossed H1 open ${openTrade.h1OpenAtEntry.toFixed(4)}`);
-        return;
       }
     }
 
