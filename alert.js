@@ -55,7 +55,7 @@ const D1 = 24 * 60 * 60;
 const DEBUG = process.env.DEBUG === "true";
 function dbg(...a) { if (DEBUG) console.log("[DBG]", ...a); }
 
-// ==================== TELEGRAM & UTILS (ROBUST HANDLER) ====================
+// ==================== TELEGRAM & UTILS ====================
 async function sendTelegram(msg) {
   if (!TG_TOKEN || !TG_CHAT_ID) {
     console.warn("Telegram not configured: TG_TOKEN or TG_CHAT_ID is missing. Skipping sendTelegram.");
@@ -151,7 +151,7 @@ async function executeManualClose(result, reason) {
   }
 }
 
-let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, phaseATriggeredEpoch: null, activeEntryType: null, pendingPullback: null, pullbackEpoch: null, pullbackTrigger: null, rsiLowerBreakSeen: false, rsiUpperBreakSeen: false };
+let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, phaseATriggeredEpoch: null, activeEntryType: null, anticipatedTrend: null, pendingPullback: null, pullbackEpoch: null, pullbackTrigger: null, rsiLowerBreakSeen: false, rsiUpperBreakSeen: false };
 try {
   const s = JSON.parse(fs.readFileSync("state.json"));
   state = {
@@ -162,6 +162,7 @@ try {
     h1TrendEpoch: s.h1TrendEpoch ?? null,
     phaseATriggeredEpoch: s.phaseATriggeredEpoch ?? null,
     activeEntryType: s.activeEntryType ?? null,
+    anticipatedTrend: s.anticipatedTrend ?? null,
     pendingPullback: s.pendingPullback ?? null,
     pullbackEpoch: s.pullbackEpoch ?? null,
     pullbackTrigger: s.pullbackTrigger ?? null,
@@ -616,12 +617,19 @@ async function runScanMode() {
     }
   }
 
-  // Evaluate M5 TDI MBL Direction
-  const mblVal = tdi.middle[i];
-  let m5Dir = null;
-  if (mblVal != null && rsi[i] != null) {
-    if (rsi[i] > mblVal) m5Dir = "BUY";
-    else if (rsi[i] < mblVal) m5Dir = "SELL";
+  // ── HARD HIGHER-TIMEFRAME TREND GATE ─────────────────────────────────
+  const h1m15Aligned = h1Dir && m15Dir && (h1Dir === m15Dir);
+  if (!h1m15Aligned) {
+    dbg("H1 and M15 trend alignment missing or conflicting. Resetting all setups.");
+    state.waitingFor = null;
+    state.setupEpoch = null;
+    state.activeEntryType = null;
+    state.pendingPullback = null;
+    state.pullbackEpoch = null;
+    state.pullbackTrigger = null;
+    state.lastProcessedEpoch = currentCandleEpoch;
+    fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+    return;
   }
 
   // Reset phase tracking if a new H1 epoch emerges
@@ -634,7 +642,9 @@ async function runScanMode() {
 
   // ── PHASE A: STRICTLY A LIVE FRESH H1 CROSS (First Trade) ────────────
   if (h1FreshCross && state.phaseATriggeredEpoch !== h1Epoch) {
-    if (m15Dir === h1Dir && m5Dir === h1Dir) {
+    const mblVal = tdi.middle[i];
+    const m5Aligned = (mblVal != null && rsi[i] != null) && ((h1Dir === "BUY" && rsi[i] > mblVal) || (h1Dir === "SELL" && rsi[i] < mblVal));
+    if (m5Aligned) {
       if (h1Dir === "BUY" && cci[i] > -114.4) {
         m5Ready = true;
         entryType = 'PHASE_A';
@@ -660,7 +670,6 @@ async function runScanMode() {
     const cciCrossBuy = (cci[i-1] <= -114.4) && (cci[i] > -114.4);
     const cciCrossSell = (cci[i-1] >= 90) && (cci[i] < 90);
     
-    // TDI MBL Cross validated by Outer-Band Breakout
     const mblPrev = tdi.middle[i-1], mblCurr = tdi.middle[i];
     const rsiPrev = rsi[i-1], rsiCurr = rsi[i];
     const rawTdiCrossUp = (rsiPrev <= mblPrev) && (rsiCurr > mblCurr);
@@ -801,7 +810,7 @@ async function runScanMode() {
     const h4Dir = h4Bullish ? "🟢 BULLISH" : "🔴 BEARISH";
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} ($7.00 soft) → trail with CCI zero-cross\n🎯 TP2: ${tp2.toFixed(4)} (reference)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | TP1: $7.00 | Safety: $${SAFETY_TP_USD}\n📊 Risk: ${risk.toFixed(2)} points\n️ H4: ${h4Dir} ✅ Direction confirmed\n⚡ Setup: Strict Fresh H1 Cross + Stateful Cross-Confirmation (${state.activeEntryType})\n🏷️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n🌍 *D1 CANDLE STATUS*\n━━━━━━━━━━━━━━━━━━━━\n`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} ($7.00 soft) → trail with CCI zero-cross\n🎯 TP2: ${tp2.toFixed(4)} (reference)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | TP1: $7.00 | Safety: $${SAFETY_TP_USD}\n📊 Risk: ${risk.toFixed(2)} points\n️ H4: ${h4Dir} ✅ Direction confirmed\n⚡ Setup: Strict Fresh H1 Cross + Stateful TDI Engine (${state.activeEntryType})\n🏷️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n🌍 *D1 CANDLE STATUS*\n━━━━━━━━━━━━━━━━━━━━\n`;
     if (d1Ctx) message += `Direction: ${d1Ctx.direction}\nD1 Open: ${d1Ctx.open.toFixed(4)}\nD1 Current: ${d1Ctx.close.toFixed(4)}\nMovement: ${d1Ctx.change.toFixed(4)} pts (${d1Ctx.changePct.toFixed(2)}%)\nAlignment: ${alignment}\n\n`;
     else message += `⚠️ D1 data unavailable\n\n`;
     message += `⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
@@ -861,6 +870,6 @@ async function runScanMode() {
     }
     return;
   }
-  if (TRIGGER_SOURCE !== "cronjob") { console.log("Not a cronjob trigger — exiting;"); return; }
+  if (TRIGGER_SOURCE !== "cronjob") { console.log("Not a cronjob trigger — exiting."); return; }
   await runScanMode();
 })();
