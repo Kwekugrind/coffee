@@ -6,9 +6,9 @@
   "h1TrendEpoch": 1786262400,
   "phaseATriggeredEpoch": 1786262400,
   "activeEntryType": null,
-  "anticipatedTrend": "SELL",
   "pendingPullback": null,
   "pullbackEpoch": null,
+  "anticipatedTrend": "SELL",
   "trendTradeCount": 0,
   "h1TrendDir": "SELL",
   "firstTradeTaken": true
