@@ -70,7 +70,7 @@
     "tp2": 6845.744285714286,
     "tp3": 6805.631428571429,
     "h1OpenAtEntry": null,
-    "tp1Reached": false,
+    "tp1Reached": true,
     "peakProfit": null,
     "rr": 1.5,
     "openTime": "2026-08-09 13:10:00",
