@@ -2,24 +2,42 @@ import WebSocket from "ws";
 import fetch from "node-fetch";
 import fs from "fs";
 
-// ==================== REPOSITORY CONFIGURATION (V75-1S DEMO) ====================
-const SYMBOL = "1HZ75V";
-const TRADING_SYMBOL = "1HZ75V";
-const SYMBOL_NAME = "Volatility 75 (1s) Index";
-const REPO_LABEL = "Coffee (V75-1s Demo)";
-const MULTIPLIER = 50;
+// ==================== REPOSITORY CONFIGURATION ====================
+// UNCOMMENT THE CONFIGURATION MATCHING YOUR REPOSITORY:
+
+// --- 1. Test Bot (Live) ---
+// const SYMBOL = "R_10"; const SYMBOL_NAME = "Volatility 10 Index"; const REPO_LABEL = "Test Bot (V10 Live)"; const MULTIPLIER = 400; const COMMISSION_USD = 0.16;
+
+// --- 2. OmniSight (Live) ---
+// const SYMBOL = "R_50"; const SYMBOL_NAME = "Volatility 50 Index"; const REPO_LABEL = "OmniSight (V50)"; const MULTIPLIER = 80; const COMMISSION_USD = 0.16;
+
+// --- 3. Lery's Alerts (Demo) ---
+// const SYMBOL = "R_75"; const SYMBOL_NAME = "Volatility 75 Index"; const REPO_LABEL = "Lery's Alerts (V75 Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
+
+// --- 4. Coffee (Demo) ---
+const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const REPO_LABEL = "Coffee (V75-1s Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
+
+// --- 5. Milk (Demo) ---
+// const SYMBOL = "R_100"; const SYMBOL_NAME = "Volatility 100 Index"; const REPO_LABEL = "Milk (V100 Demo)"; const MULTIPLIER = 40; const COMMISSION_USD = 0.15;
+
+// --- 6. Tea (Demo) ---
+// const SYMBOL = "R_25"; const SYMBOL_NAME = "Volatility 25 Index"; const REPO_LABEL = "Tea (V25 Demo)"; const MULTIPLIER = 160; const COMMISSION_USD = 0.15;
+
+// --- 7. Ice Cream Machine (Demo) ---
+// const SYMBOL = "1HZ100V"; const SYMBOL_NAME = "Volatility 100 (1s) Index"; const REPO_LABEL = "Ice Cream Machine"; const MULTIPLIER = 40; const COMMISSION_USD = 0.15;
+
+const TRADING_SYMBOL = SYMBOL;
 const STAKE_USD = 10;
 const RISK_REWARD = 1.5;
 const SAFETY_TP_USD = 15; // Hard dollar ceiling — close immediately
-const TRAIL_ACTIVATE_USD = 5; // Start high-water-mark trailing at this profit
-const TRAIL_DROP_USD = 3; // Exit if profit drops this much from peak
-const BREAKEVEN_ACTIVATE_USD = 3.00; // Move SL to entry once profit hits this amount
-const COMMISSION_USD = 0.15; // $0.16 for Live trades | $0.15 for Demo trades
+const TRAIL_ACTIVATE_USD = 3.00; // Start high-water-mark trailing at $3.00 profit
+const TRAIL_DROP_USD = 1.00; // Exit if profit drops $1.00 from peak
+const BREAKEVEN_ACTIVATE_USD = 3.00; // Move SL to entry once profit hits $3.00
 const ATR_PERIOD = 14;
 const ATR_MULTIPLIER = 2.0; // Stop loss breathing room
 const SETUP_EXPIRY_BARS = 35;
 const MARKET_DATA_APP_ID = "1089";
-const DERIV_APP_ID = process.env.DERIV_APP_ID;
+const DERIV_APP_ID = process.env.DERIV_APP_ID || "67418";
 const TG_TOKEN = process.env.TG_BOT_TOKEN || process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const DERIV_TOKEN = process.env.DERIV_API_TOKEN;
@@ -37,9 +55,12 @@ const D1 = 24 * 60 * 60;
 const DEBUG = process.env.DEBUG === "true";
 function dbg(...a) { if (DEBUG) console.log("[DBG]", ...a); }
 
-// ==================== TELEGRAM & UTILS ====================
+// ==================== TELEGRAM & UTILS (ROBUST HANDLER) ====================
 async function sendTelegram(msg) {
-  if (!TG_TOKEN || !TG_CHAT_ID) return;
+  if (!TG_TOKEN || !TG_CHAT_ID) {
+    console.warn("Telegram not configured: TG_TOKEN or TG_CHAT_ID is missing. Skipping sendTelegram.");
+    return { ok: false, error: "missing_credentials" };
+  }
   const send = async (text, parseMode) => {
     const body = { chat_id: TG_CHAT_ID, text };
     if (parseMode) body.parse_mode = parseMode;
@@ -47,17 +68,25 @@ async function sendTelegram(msg) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
-    return res.json();
+    let json;
+    try { json = await res.json(); } catch (e) { json = { ok: false, error: `invalid_json_response: ${e.message}` }; }
+    json.__http_status = res.status;
+    return json;
   };
   try {
     const data = await send(msg, "Markdown");
     if (!data.ok) {
-      console.error(`Telegram Markdown rejected (${data.error_code}): ${data.description}`);
+      console.error(`Telegram Markdown rejected (${data.error_code || data.error || 'unknown'}): ${data.description || JSON.stringify(data)}`);
       const plain = msg.replace(/[*_`\[\]]/g, "");
       const retry = await send(plain, "");
-      if (!retry.ok) console.error(`Telegram plain-text retry also failed: ${retry.description}`);
+      if (!retry.ok) {
+        console.error(`Telegram plain-text retry also failed: ${retry.description || JSON.stringify(retry)}`);
+        return { ok: false, error: "telegram_send_failed", detail: retry };
+      }
+      return { ok: true, via: "plain_text", detail: retry };
     }
-  } catch (e) { console.error("Telegram fetch error:", e.message); }
+    return { ok: true, via: "markdown", detail: data };
+  } catch (e) { console.error("Telegram fetch error:", e.message); return { ok: false, error: e.message }; }
 }
 
 function formatDuration(ms) {
@@ -86,7 +115,7 @@ async function checkTelegramCommands() {
     if (!data.ok) return;
     for (const update of data.result) {
       state.lastTgUpdateId = update.update_id;
-      const text = update.message?.text?.trim().toLowerCase();
+      const text = update.message?.text?.trim()?.toLowerCase();
       if (text === "/status") {
         const trades = fs.existsSync("trades.json") ? JSON.parse(fs.readFileSync("trades.json")) : [];
         const open = trades.filter(t => !t.result);
@@ -122,7 +151,7 @@ async function executeManualClose(result, reason) {
   }
 }
 
-let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, phaseATriggeredEpoch: null, activeEntryType: null, pendingPullback: null, pullbackEpoch: null };
+let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, phaseATriggeredEpoch: null, activeEntryType: null, pendingPullback: null, pullbackEpoch: null, pullbackTrigger: null, rsiLowerBreakSeen: false, rsiUpperBreakSeen: false };
 try {
   const s = JSON.parse(fs.readFileSync("state.json"));
   state = {
@@ -134,7 +163,10 @@ try {
     phaseATriggeredEpoch: s.phaseATriggeredEpoch ?? null,
     activeEntryType: s.activeEntryType ?? null,
     pendingPullback: s.pendingPullback ?? null,
-    pullbackEpoch: s.pullbackEpoch ?? null
+    pullbackEpoch: s.pullbackEpoch ?? null,
+    pullbackTrigger: s.pullbackTrigger ?? null,
+    rsiLowerBreakSeen: s.rsiLowerBreakSeen ?? false,
+    rsiUpperBreakSeen: s.rsiUpperBreakSeen ?? false
   };
 } catch {}
 
@@ -196,8 +228,15 @@ async function getDerivAccountId() {
   if (!res.ok) throw new Error(`getAccounts failed: ${JSON.stringify(json.errors || json)}`);
   const accounts = json.data;
   if (!accounts || accounts.length === 0) throw new Error("No Deriv accounts found");
-  // DEMO ACCOUNT SELECTOR EXCLUSIVE TO DEMO REPOS
+  
+  // ==================== ACCOUNT ROUTING (SELECT ONE) ====================
+  // For LIVE Repos (Test Bot, OmniSight):
+  // const account = accounts.find(a => a.account_type !== "demo") || accounts[0];
+  
+  // For DEMO Repos (Lery's Alerts, Coffee, Milk, Tea, Ice Cream Machine):
   const account = accounts.find(a => a.account_type === "demo") || accounts[0];
+  // ======================================================================
+
   console.log(` Account ID: ${account.account_id} (${account.account_type})`);
   return account.account_id;
 }
@@ -323,6 +362,69 @@ function calculateCCI(candles, period = 34) {
   });
 }
 
+function calculateRSI(data, period = 14) {
+  const result = new Array(data.length).fill(null);
+  if (data.length <= period) return result;
+  let gainSum = 0, lossSum = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = data[i] - data[i-1];
+    if (diff >= 0) gainSum += diff;
+    else lossSum -= diff;
+  }
+  let avgGain = gainSum / period;
+  let avgLoss = lossSum / period;
+  let rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+  result[period] = 100 - (100 / (1 + rs));
+  for (let i = period + 1; i < data.length; i++) {
+    const diff = data[i] - data[i-1];
+    const gain = diff >= 0 ? diff : 0;
+    const loss = diff >= 0 ? 0 : -diff;
+    avgGain = ((avgGain * (period - 1)) + gain) / period;
+    avgLoss = ((avgLoss * (period - 1)) + loss) / period;
+    rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    result[i] = 100 - (100 / (1 + rs));
+  }
+  return result;
+}
+
+function calculateBollingerBands(data, period = 34, deviation = 1.619) {
+  const middle = sma(data, period);
+  const upper = [];
+  const lower = [];
+  for (let i = 0; i < data.length; i++) {
+    if (i < period - 1 || middle[i] == null || data[i] == null) {
+      upper.push(null);
+      lower.push(null);
+      continue;
+    }
+    const slice = data.slice(i - period + 1, i + 1);
+    if (slice.some(val => val == null)) {
+      upper.push(null);
+      lower.push(null);
+      continue;
+    }
+    const mean = middle[i];
+    const variance = slice.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / period;
+    const stdev = Math.sqrt(variance);
+    upper.push(mean + (stdev * deviation));
+    lower.push(mean - (stdev * deviation));
+  }
+  return { upper, middle, lower };
+}
+
+function getBGAInfo(price) {
+  let step = 100;
+  if (price > 10000) step = 500;
+  else if (price > 1000) step = 100;
+  const whole = Math.round(price / step) * step;
+  const half = whole - (step / 2);
+  const isWhole = Math.abs(price - whole) <= (step * 0.05);
+  const isHalf = Math.abs(price - half) <= (step * 0.05);
+  if (isWhole) return `BGA Whole Level (${whole})`;
+  if (isHalf) return `BGA Half Level (${half})`;
+  return `BGA Zone (Near ${whole})`;
+}
+
 async function fetchH4Candle() {
   try {
     const candles = await fetchCandles(H4, 10);
@@ -422,7 +524,7 @@ async function runScanMode() {
       }
     }
 
-    // 4. High-Water Mark Trailing
+    // 4. High-Water Mark Trailing ($3.00 activation, $1.00 drop)
     if (pnl >= TRAIL_ACTIVATE_USD) {
       if (openTrade.peakProfit === null || pnl > openTrade.peakProfit) {
         openTrade.peakProfit = pnl;
@@ -460,7 +562,7 @@ async function runScanMode() {
     return;
   }
 
-  // ── Signal Scan (Strict Phase A Fresh H1 Cross + Stateful Phase B Pullbacks) ──
+  // ── Signal Scan (Strict Phase A Fresh H1 Cross + Stateful Phase B TDI/CCI Engine) ──
   const candles = await fetchCandles(M5, 120);
   if (!candles || candles.length < 60) { console.log("Not enough M5 candles."); return; }
   const i = candles.length - 2;
@@ -475,6 +577,14 @@ async function runScanMode() {
   const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
   const atr14 = calculateATR(candles, ATR_PERIOD);
   const cci = calculateCCI(candles, 34);
+  const rsi = calculateRSI(closes, 14);
+  const tdi = calculateBollingerBands(rsi, 34, 1.619);
+
+  // Track if RSI touched/broke outer bands for TDI validity
+  if (rsi[i] != null && tdi.lower[i] != null && tdi.upper[i] != null) {
+    if (rsi[i] <= tdi.lower[i]) state.rsiLowerBreakSeen = true;
+    if (rsi[i] >= tdi.upper[i]) state.rsiUpperBreakSeen = true;
+  }
 
   // Evaluate H1 Trend Direction & Fresh Cross
   const h1Candles = await fetchCandles(H1, 100);
@@ -506,13 +616,12 @@ async function runScanMode() {
     }
   }
 
-  // Evaluate M5 MACD & Direction
-  const m5Macd = calculateMACD(closes, 3, 50, 1);
-  const m5SignalVal = m5Macd.signalLine[i];
+  // Evaluate M5 TDI MBL Direction
+  const mblVal = tdi.middle[i];
   let m5Dir = null;
-  if (m5SignalVal != null) {
-    if (m5SignalVal > 0) m5Dir = "BUY";
-    else if (m5SignalVal < 0) m5Dir = "SELL";
+  if (mblVal != null && rsi[i] != null) {
+    if (rsi[i] > mblVal) m5Dir = "BUY";
+    else if (rsi[i] < mblVal) m5Dir = "SELL";
   }
 
   // Reset phase tracking if a new H1 epoch emerges
@@ -542,69 +651,102 @@ async function runScanMode() {
     if (state.pendingPullback && state.pullbackEpoch && (currentCandleEpoch - state.pullbackEpoch) > (SETUP_EXPIRY_BARS * M5)) {
       state.pendingPullback = null;
       state.pullbackEpoch = null;
+      state.pullbackTrigger = null;
+      state.rsiLowerBreakSeen = false;
+      state.rsiUpperBreakSeen = false;
       console.log("Pending pullback setup expired (35 bars reached).");
     }
 
     const cciCrossBuy = (cci[i-1] <= -114.4) && (cci[i] > -114.4);
     const cciCrossSell = (cci[i-1] >= 90) && (cci[i] < 90);
-    const macdCrossUp = (m5Macd.signalLine[i-1] <= 0) && (m5SignalVal > 0);
-    const macdCrossDown = (m5Macd.signalLine[i-1] >= 0) && (m5SignalVal < 0);
+    
+    // TDI MBL Cross validated by Outer-Band Breakout
+    const mblPrev = tdi.middle[i-1], mblCurr = tdi.middle[i];
+    const rsiPrev = rsi[i-1], rsiCurr = rsi[i];
+    const rawTdiCrossUp = (rsiPrev <= mblPrev) && (rsiCurr > mblCurr);
+    const rawTdiCrossDown = (rsiPrev >= mblPrev) && (rsiCurr < mblCurr);
+
+    const tdiCrossUp = rawTdiCrossUp && state.rsiLowerBreakSeen;
+    const tdiCrossDown = rawTdiCrossDown && state.rsiUpperBreakSeen;
+
+    if (tdiCrossUp) state.rsiLowerBreakSeen = false;
+    if (tdiCrossDown) state.rsiUpperBreakSeen = false;
 
     // 2. Invalidation Checks for Active Pending States (Opposite Crosses)
     if (state.pendingPullback === "BUY") {
-      const oppositeMacdCross = (m5Macd.signalLine[i-1] >= 0) && (m5SignalVal < 0);
+      const oppositeTdiCross = (rsiPrev >= mblPrev) && (rsiCurr < mblCurr);
       const oppositeCciCross = (cci[i-1] > -114.4) && (cci[i] <= -114.4);
-      if (oppositeMacdCross || oppositeCciCross || h1Dir !== "BUY") {
+      if (oppositeTdiCross || oppositeCciCross || h1Dir !== "BUY") {
         console.log("Pending BUY pullback invalidated by opposite cross or trend shift.");
         state.pendingPullback = null;
         state.pullbackEpoch = null;
+        state.pullbackTrigger = null;
       }
     } else if (state.pendingPullback === "SELL") {
-      const oppositeMacdCross = (m5Macd.signalLine[i-1] <= 0) && (m5SignalVal > 0);
+      const oppositeTdiCross = (rsiPrev <= mblPrev) && (rsiCurr > mblCurr);
       const oppositeCciCross = (cci[i-1] < 90) && (cci[i] >= 90);
-      if (oppositeMacdCross || oppositeCciCross || h1Dir !== "SELL") {
+      if (oppositeTdiCross || oppositeCciCross || h1Dir !== "SELL") {
         console.log("Pending SELL pullback invalidated by opposite cross or trend shift.");
         state.pendingPullback = null;
         state.pullbackEpoch = null;
+        state.pullbackTrigger = null;
       }
     }
 
     // 3. Confirmation & Arming Checks
     if (state.pendingPullback === "BUY") {
-      if (m5SignalVal > 0 || macdCrossUp) {
+      if (state.pullbackTrigger === "CCI" && tdiCrossUp) {
         m5Ready = true;
         entryType = 'PHASE_B';
         state.pendingPullback = null;
         state.pullbackEpoch = null;
+        state.pullbackTrigger = null;
+      } else if (state.pullbackTrigger === "TDI" && cciCrossBuy) {
+        m5Ready = true;
+        entryType = 'PHASE_B';
+        state.pendingPullback = null;
+        state.pullbackEpoch = null;
+        state.pullbackTrigger = null;
       }
     } else if (state.pendingPullback === "SELL") {
-      if (m5SignalVal < 0 || macdCrossDown) {
+      if (state.pullbackTrigger === "CCI" && tdiCrossDown) {
         m5Ready = true;
         entryType = 'PHASE_B';
         state.pendingPullback = null;
         state.pullbackEpoch = null;
+        state.pullbackTrigger = null;
+      } else if (state.pullbackTrigger === "TDI" && cciCrossSell) {
+        m5Ready = true;
+        entryType = 'PHASE_B';
+        state.pendingPullback = null;
+        state.pullbackEpoch = null;
+        state.pullbackTrigger = null;
       }
     } else {
       // Arm new pending pullback state if either indicator triggers first
       if (h1Dir === "BUY") {
         if (cciCrossBuy) {
           state.pendingPullback = "BUY";
+          state.pullbackTrigger = "CCI";
           state.pullbackEpoch = currentCandleEpoch;
-          console.log("CCI crossed oversold upward first. Armed waiting for MACD confirmation.");
-        } else if (macdCrossUp) {
+          console.log("CCI crossed -114.4 upward first. Waiting for TDI MBL cross.");
+        } else if (tdiCrossUp) {
           state.pendingPullback = "BUY";
+          state.pullbackTrigger = "TDI";
           state.pullbackEpoch = currentCandleEpoch;
-          console.log("M5 MACD crossed zero upward first. Armed waiting for CCI confirmation.");
+          console.log("TDI MBL crossed upward first. Waiting for CCI cross.");
         }
       } else if (h1Dir === "SELL") {
         if (cciCrossSell) {
           state.pendingPullback = "SELL";
+          state.pullbackTrigger = "CCI";
           state.pullbackEpoch = currentCandleEpoch;
-          console.log("CCI crossed overbought downward first. Armed waiting for MACD confirmation.");
-        } else if (macdCrossDown) {
+          console.log("CCI crossed 90 downward first. Waiting for TDI MBL cross.");
+        } else if (tdiCrossDown) {
           state.pendingPullback = "SELL";
+          state.pullbackTrigger = "TDI";
           state.pullbackEpoch = currentCandleEpoch;
-          console.log("M5 MACD crossed zero downward first. Armed waiting for CCI confirmation.");
+          console.log("TDI MBL crossed downward first. Waiting for CCI cross.");
         }
       }
     }
@@ -657,8 +799,9 @@ async function runScanMode() {
     const alignment = d1Ctx ? checkAlignment(direction, d1Ctx.direction) : "⚠️ D1 data unavailable";
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const h4Dir = h4Bullish ? "🟢 BULLISH" : "🔴 BEARISH";
+    const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} ($7.00 soft) → trail with CCI zero-cross\n🎯 TP2: ${tp2.toFixed(4)} (reference)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | TP1: $7.00 | Safety: $${SAFETY_TP_USD}\n📊 Risk: ${risk.toFixed(2)} points\n️ H4: ${h4Dir} ✅ Direction confirmed\n⚡ Setup: Strict Fresh H1 Cross + Stateful Cross-Confirmation (${state.activeEntryType})\n━━━━━━━━━━━━━━━━━━━━\n🌍 *D1 CANDLE STATUS*\n━━━━━━━━━━━━━━━━━━━━\n`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} ($7.00 soft) → trail with CCI zero-cross\n🎯 TP2: ${tp2.toFixed(4)} (reference)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | TP1: $7.00 | Safety: $${SAFETY_TP_USD}\n📊 Risk: ${risk.toFixed(2)} points\n️ H4: ${h4Dir} ✅ Direction confirmed\n⚡ Setup: Strict Fresh H1 Cross + Stateful Cross-Confirmation (${state.activeEntryType})\n🏷️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n🌍 *D1 CANDLE STATUS*\n━━━━━━━━━━━━━━━━━━━━\n`;
     if (d1Ctx) message += `Direction: ${d1Ctx.direction}\nD1 Open: ${d1Ctx.open.toFixed(4)}\nD1 Current: ${d1Ctx.close.toFixed(4)}\nMovement: ${d1Ctx.change.toFixed(4)} pts (${d1Ctx.changePct.toFixed(2)}%)\nAlignment: ${alignment}\n\n`;
     else message += `⚠️ D1 data unavailable\n\n`;
     message += `⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
@@ -691,6 +834,9 @@ async function runScanMode() {
     state.activeEntryType = null;
     state.pendingPullback = null;
     state.pullbackEpoch = null;
+    state.pullbackTrigger = null;
+    state.rsiLowerBreakSeen = false;
+    state.rsiUpperBreakSeen = false;
   }
 
   state.lastProcessedEpoch = currentCandleEpoch;
@@ -715,6 +861,6 @@ async function runScanMode() {
     }
     return;
   }
-  if (TRIGGER_SOURCE !== "cronjob") { console.log("Not a cronjob trigger — exiting."); return; }
+  if (TRIGGER_SOURCE !== "cronjob") { console.log("Not a cronjob trigger — exiting;"); return; }
   await runScanMode();
 })();
