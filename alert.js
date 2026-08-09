@@ -474,6 +474,7 @@ async function runScanMode() {
   }
 
   const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
+  const atr14 = calculateATR(candles, ATR_PERIOD);
   const cci = calculateCCI(candles, 34);
 
   // Evaluate H1 Trend Direction
