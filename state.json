@@ -1,11 +1,14 @@
 {
   "waitingFor": null,
   "setupEpoch": null,
-  "lastProcessedEpoch": 1786262400,
+  "lastProcessedEpoch": 1786264200,
   "lastTgUpdateId": 16871118,
   "h1TrendEpoch": 1786258800,
   "phaseATriggeredEpoch": null,
   "activeEntryType": null,
+  "anticipatedTrend": null,
+  "pendingPullback": null,
+  "pullbackEpoch": null,
   "trendTradeCount": 0,
   "h1TrendDir": "SELL",
   "firstTradeTaken": true
