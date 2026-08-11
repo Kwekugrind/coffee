@@ -427,8 +427,13 @@ function calculateBollingerBands(data, period = 34, deviation = 1.619) {
 
 function getBGAInfo(price) {
   let step = 100;
-  if (price > 10000) step = 500;
-  else if (price > 1000) step = 100;
+  if (price > 20000) step = 500;
+  else if (price > 10000) step = 200;
+  else if (price > 5000) step = 100;
+  else if (price > 2000) step = 50;
+  else if (price > 1000) step = 20;
+  else step = 10;
+
   const whole = Math.round(price / step) * step;
   const half = whole - (step / 2);
   const isWhole = Math.abs(price - whole) <= (step * 0.05);
@@ -440,8 +445,12 @@ function getBGAInfo(price) {
 
 function calculateBgaTakeProfits(entry, direction, atr14) {
   let step = 100;
-  if (entry > 10000) step = 500;
-  else if (entry > 1000) step = 100;
+  if (entry > 20000) step = 500;
+  else if (entry > 10000) step = 200;
+  else if (entry > 5000) step = 100;
+  else if (entry > 2000) step = 50;
+  else if (entry > 1000) step = 20;
+  else step = 10;
 
   const halfStep = step / 2;
   const baseWhole = Math.round(entry / step) * step;
