@@ -29,9 +29,6 @@ const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const R
 const TRADING_SYMBOL = SYMBOL;
 const STAKE_USD = 10;
 const RISK_REWARD = 1.5;
-const SAFETY_TP_USD = 15; // Kept as fallback/safety ceiling
-const TRAIL_ACTIVATE_USD = 3.00; // Legacy activation reference
-const TRAIL_DROP_USD = 1.00; // Legacy drop reference
 const BREAKEVEN_ACTIVATE_USD = 3.00; // Move SL to entry once profit hits $3.00
 const ATR_PERIOD = 14;
 const ATR_MULTIPLIER = 2.0; // Stop loss breathing room
@@ -139,12 +136,20 @@ async function executeManualClose(result, reason) {
     if (trade.contractId) { 
       try { 
         const closeRes = await closeContract(trade.contractId); 
-        if (closeRes && closeRes.sell && typeof closeRes.sell.profit === 'number') {
+        if (!closeRes || closeRes.error) {
+          const errDesc = closeRes?.error?.message || JSON.stringify(closeRes);
+          await sendTelegram(`⚠️ *${REPO_LABEL}* — Manual Close Warning\n\nFailed to close contract \`${trade.contractId}\` on Deriv: ${errDesc}. Retrying next scan.`);
+          continue; 
+        }
+        if (typeof closeRes.sell?.profit === 'number') {
           serverPnl = closeRes.sell.profit;
         }
-      } catch (e) { console.error("Close error:", e.message); } 
+      } catch (e) { 
+        console.error("Close error:", e.message); 
+        continue; 
+      } 
     }
-    
+
     trade.result = result;
     trade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
     fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
@@ -260,7 +265,7 @@ async function getDerivOTP(accountId) {
   return json.data.url;
 }
 
-async function executeTrade(direction, tp2Price) {
+async function executeTrade(direction) {
   if (!DERIV_TOKEN) { console.log("⚠️ DERIV_API_TOKEN not set. Skipping."); return null; }
   if (!DERIV_APP_ID) { console.log("⚠️ DERIV_APP_ID not set. Skipping."); return null; }
   if (!PROXY_URL || !PROXY_SECRET) { console.log("⚠️ PROXY_URL or PROXY_SECRET not set. Skipping."); return null; }
@@ -268,7 +273,6 @@ async function executeTrade(direction, tp2Price) {
   const accountId = await getDerivAccountId();
   const wsUrl = await getDerivOTP(accountId);
   const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
-  
   const params = {
     buy: "1",
     price: STAKE_USD,
@@ -280,8 +284,7 @@ async function executeTrade(direction, tp2Price) {
       basis: "stake",
       multiplier: MULTIPLIER,
       limit_order: {
-        stop_loss: slDollars,
-        take_profit: SAFETY_TP_USD
+        stop_loss: slDollars
       }
     }
   };
@@ -442,27 +445,57 @@ function calculateBgaTakeProfits(entry, direction, atr14) {
 
   const halfStep = step / 2;
   const baseWhole = Math.round(entry / step) * step;
-  const levels = [];
-  for (let offset = -5 * step; offset <= 5 * step; offset += halfStep) {
-    levels.push(baseWhole + offset);
-  }
 
   // Minimum distance buffer to prevent micro-targets (at least 20% of step or 1.2 * ATR)
   const minBuffer = Math.max(step * 0.20, atr14 * 1.2);
 
+  // Generate the full fine grid (Whole and Half numbers) for sequencing
+  const allLevels = [];
+  for (let offset = -10 * step; offset <= 15 * step; offset += halfStep) {
+    allLevels.push(baseWhole + offset);
+  }
+
   if (direction === "BUY") {
-    const validLevels = levels.filter(l => (l - entry) >= minBuffer).sort((a, b) => a - b);
+    // 1. TP1 MUST BE A BGA WHOLE NUMBER strictly above entry satisfying minBuffer
+    let w = baseWhole;
+    if (w <= entry) w += step;
+    let validTp1 = null;
+    while (!validTp1 && w <= entry + (step * 5)) {
+      if ((w - entry) >= minBuffer) {
+        validTp1 = w;
+      }
+      w += step;
+    }
+    const tp1 = validTp1 || (baseWhole + step);
+
+    // 2. TP2 and TP3 are the next immediate BGA levels (Half then Whole) after TP1
+    const futureLevels = allLevels.filter(l => l > tp1).sort((a, b) => a - b);
+
     return {
-      tp1: validLevels[0] || entry + step,
-      tp2: validLevels[1] || entry + (step * 2),
-      tp3: validLevels[2] || entry + (step * 3)
+      tp1: tp1,
+      tp2: futureLevels[0] || tp1 + halfStep,
+      tp3: futureLevels[1] || tp1 + step
     };
+
   } else {
-    const validLevels = levels.filter(l => (entry - l) >= minBuffer).sort((a, b) => b - a);
+    // SELL direction: TP1 MUST BE A BGA WHOLE NUMBER strictly below entry satisfying minBuffer
+    let w = baseWhole;
+    if (w >= entry) w -= step;
+    let validTp1 = null;
+    while (!validTp1 && w >= entry - (step * 5)) {
+      if ((entry - w) >= minBuffer) {
+        validTp1 = w;
+      }
+      w -= step;
+    }
+    const tp1 = validTp1 || (baseWhole - step);
+
+    const futureLevels = allLevels.filter(l => l < tp1).sort((a, b) => b - a);
+
     return {
-      tp1: validLevels[0] || entry - step,
-      tp2: validLevels[1] || entry - (step * 2),
-      tp3: validLevels[2] || entry - (step * 3)
+      tp1: tp1,
+      tp2: futureLevels[0] || tp1 - halfStep,
+      tp3: futureLevels[1] || tp1 - step
     };
   }
 }
@@ -517,10 +550,20 @@ async function runScanMode() {
       if (openTrade.contractId) {
         try {
           const closeRes = await closeContract(openTrade.contractId);
-          if (closeRes && closeRes.sell && typeof closeRes.sell.profit === 'number') {
+          if (!closeRes || closeRes.error) {
+            const errDesc = closeRes?.error?.message || JSON.stringify(closeRes);
+            console.error(`⚠️ Failed to close contract on Deriv: ${errDesc}`);
+            await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Warning\n\nFailed to close contract \`${openTrade.contractId}\` on Deriv: ${errDesc}. Retrying next scan.`);
+            return; // Abort local closure so it retries!
+          }
+          if (typeof closeRes.sell?.profit === 'number') {
             serverPnl = closeRes.sell.profit;
           }
-        } catch (e) { console.error("Close error:", e.message); }
+        } catch (e) {
+          console.error("Close exception:", e.message);
+          await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Error\n\nException closing contract \`${openTrade.contractId}\`: ${e.message}. Retrying next scan.`);
+          return; // Abort local closure so it retries!
+        }
       }
 
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
@@ -566,17 +609,17 @@ async function runScanMode() {
       return;
     }
 
-    // 3. TP1 Price Level Hit (First BGA Level)
+    // 3. TP1 Price Level Hit (First BGA Whole Number) -> Arms 60% Peak-Drop Trailing
     if (!openTrade.tp1Reached) {
       const tp1Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1;
       if (tp1Hit) {
         openTrade.tp1Reached = true;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-        await sendTelegram(`🎯 TP1 BGA level reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — trailing momentum armed (60% peak rule active).`);
+        await sendTelegram(`🎯 TP1 BGA Whole Number reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — 60% peak-drop trailing now armed.`);
       }
     }
 
-    // 4. High-Water Mark Trailing (Activated at TP1, exits if profit drops 60% from peak)
+    // 4. High-Water Mark Trailing (Activated at TP1 BGA Whole Number, exits if profit drops 60% from peak)
     if (openTrade.tp1Reached) {
       if (openTrade.peakProfit === null || pnl > openTrade.peakProfit) {
         openTrade.peakProfit = pnl;
@@ -848,7 +891,7 @@ async function runScanMode() {
   if (signalTriggered) {
     const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
     
-    // Calculate BGA-based TP1, TP2 (Ultimate TP), and TP3 with Minimum Distance Buffer
+    // Calculate BGA-based TP1 (Strict Whole Number), TP2 (Ultimate TP / Half Number), and TP3
     const bgaTps = calculateBgaTakeProfits(entry, direction, atr14);
     tp1 = bgaTps.tp1;
     tp2 = bgaTps.tp2;
@@ -867,29 +910,34 @@ async function runScanMode() {
     const h4Dir = h4Bullish ? "🟢 BULLISH" : "🔴 BEARISH";
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA) → trail with CCI zero-cross\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | TP1: ${tp1.toFixed(4)} | TP2: ${tp2.toFixed(4)}\n📊 Risk: ${risk.toFixed(2)} points\n️ H4: ${h4Dir} ✅ Direction confirmed\n⚡ Setup: Strict Fresh H1 Cross + Stateful TDI Engine (${state.activeEntryType})\n🏷️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n🌍 *D1 CANDLE STATUS*\n━━━━━━━━━━━━━━━━━━━━\n`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole) → trail with CCI zero-cross\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | TP1: ${tp1.toFixed(4)} | TP2: ${tp2.toFixed(4)}\n📊 Risk: ${risk.toFixed(2)} points\n️ H4: ${h4Dir} ✅ Direction confirmed\n⚡ Setup: Strict Fresh H1 Cross + Stateful TDI Engine (${state.activeEntryType})\n🏷️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n🌍 *D1 CANDLE STATUS*\n━━━━━━━━━━━━━━━━━━━━\n`;
     if (d1Ctx) message += `Direction: ${d1Ctx.direction}\nD1 Open: ${d1Ctx.open.toFixed(4)}\nD1 Current: ${d1Ctx.close.toFixed(4)}\nMovement: ${d1Ctx.change.toFixed(4)} pts (${d1Ctx.changePct.toFixed(2)}%)\nAlignment: ${alignment}\n\n`;
     else message += `⚠️ D1 data unavailable\n\n`;
     message += `⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
-    await sendTelegram(message);
-
-    trades.push({
-      id: `${SYMBOL}-${isoTime}`, contractId: null, repo: REPO_LABEL, symbol: SYMBOL,
-      direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry: null, tp1Reached: false,
-      peakProfit: null, rr: RISK_REWARD, openTime: timeFormatted,
-      closeTime: null, result: null
-    });
-    fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-
+    // CRITICAL FIX: Only record trade and send alert AFTER successful broker execution!
     try {
-      const contractId = await executeTrade(direction, tp2);
-      if (contractId) {
-        trades[trades.length - 1].contractId = contractId;
-        fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+      const contractId = await executeTrade(direction);
+      if (!contractId) {
+        console.error("⚠️ Trade execution returned no contract ID. Skipping trade record.");
+        await sendTelegram(`❌ *${REPO_LABEL}*\n\nSignal triggered for ${direction}, but live broker execution failed. Trade aborted.`);
+        return;
       }
+
+      await sendTelegram(message);
+
+      trades.push({
+        id: `${SYMBOL}-${isoTime}`, contractId, repo: REPO_LABEL, symbol: SYMBOL,
+        direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry: null, tp1Reached: false,
+        peakProfit: null, rr: RISK_REWARD, openTime: timeFormatted,
+        closeTime: null, result: null
+      });
+      fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+
     } catch (execErr) {
       console.error("⚠️ Live execution warning:", execErr.message);
+      await sendTelegram(`❌ *${REPO_LABEL}*\n\nLive execution warning: ${execErr.message}`);
+      return;
     }
 
     if (state.activeEntryType === 'PHASE_A') {
