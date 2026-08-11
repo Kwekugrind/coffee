@@ -1,15 +1,15 @@
 {
   "waitingFor": null,
   "setupEpoch": null,
-  "lastProcessedEpoch": 1786448700,
+  "lastProcessedEpoch": 1786449000,
   "lastTgUpdateId": 16871119,
   "h1TrendEpoch": 1786442400,
   "phaseATriggeredEpoch": 1786384800,
   "activeEntryType": null,
   "anticipatedTrend": null,
-  "pendingPullback": "BUY",
-  "pullbackEpoch": 1786448700,
-  "pullbackTrigger": "TDI",
+  "pendingPullback": null,
+  "pullbackEpoch": null,
+  "pullbackTrigger": null,
   "rsiLowerBreakSeen": false,
   "rsiUpperBreakSeen": false
 }
