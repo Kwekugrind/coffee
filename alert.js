@@ -137,9 +137,14 @@ async function executeManualClose(result, reason) {
       try { 
         const closeRes = await closeContract(trade.contractId); 
         if (!closeRes || closeRes.error) {
-          const errDesc = closeRes?.error?.message || JSON.stringify(closeRes);
-          await sendTelegram(`⚠️ *${REPO_LABEL}* — Manual Close Warning\n\nFailed to close contract \`${trade.contractId}\` on Deriv: ${errDesc}. Retrying next scan.`);
-          continue; 
+          const errCode = closeRes.error?.code;
+          const errDesc = closeRes.error?.message || JSON.stringify(closeRes.error);
+          if (errCode === "ContractNotFound" || errDesc.includes("not found among your open positions")) {
+            serverPnl = -5.00; // Reflect hard SL loss when stopped out on server
+          } else {
+            await sendTelegram(`⚠️ *${REPO_LABEL}* — Manual Close Warning\n\nFailed to close contract \`${trade.contractId}\` on Deriv: ${errDesc}. Retrying next scan.`);
+            continue; 
+          }
         }
         if (typeof closeRes.sell?.profit === 'number') {
           serverPnl = closeRes.sell.profit;
@@ -164,7 +169,7 @@ async function executeManualClose(result, reason) {
   }
 }
 
-let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, phaseATriggeredEpoch: null, activeEntryType: null, anticipatedTrend: null, pendingPullback: null, pullbackEpoch: null, pullbackTrigger: null, rsiLowerBreakSeen: false, rsiUpperBreakSeen: false };
+let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, phaseATriggeredEpoch: null, phaseCTriggeredEpoch: null, activeEntryType: null, anticipatedTrend: null, pendingPullback: null, pullbackEpoch: null, pullbackTrigger: null, rsiLowerBreakSeen: false, rsiUpperBreakSeen: false, h1m15WasAligned: false };
 try {
   const s = JSON.parse(fs.readFileSync("state.json"));
   state = {
@@ -174,13 +179,15 @@ try {
     setupEpoch: s.setupEpoch ?? null,
     h1TrendEpoch: s.h1TrendEpoch ?? null,
     phaseATriggeredEpoch: s.phaseATriggeredEpoch ?? null,
+    phaseCTriggeredEpoch: s.phaseCTriggeredEpoch ?? null,
     activeEntryType: s.activeEntryType ?? null,
     anticipatedTrend: s.anticipatedTrend ?? null,
     pendingPullback: s.pendingPullback ?? null,
     pullbackEpoch: s.pullbackEpoch ?? null,
     pullbackTrigger: s.pullbackTrigger ?? null,
     rsiLowerBreakSeen: s.rsiLowerBreakSeen ?? false,
-    rsiUpperBreakSeen: s.rsiUpperBreakSeen ?? false
+    rsiUpperBreakSeen: s.rsiUpperBreakSeen ?? false,
+    h1m15WasAligned: s.h1m15WasAligned ?? false
   };
 } catch {}
 
@@ -560,12 +567,16 @@ async function runScanMode() {
         try {
           const closeRes = await closeContract(openTrade.contractId);
           if (!closeRes || closeRes.error) {
-            const errDesc = closeRes?.error?.message || JSON.stringify(closeRes);
-            console.error(`⚠️ Failed to close contract on Deriv: ${errDesc}`);
-            await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Warning\n\nFailed to close contract \`${openTrade.contractId}\` on Deriv: ${errDesc}. Retrying next scan.`);
-            return; // Abort local closure so it retries!
-          }
-          if (typeof closeRes.sell?.profit === 'number') {
+            const errCode = closeRes.error?.code;
+            const errDesc = closeRes.error?.message || JSON.stringify(closeRes.error);
+            if (errCode === "ContractNotFound" || errDesc.includes("not found among your open positions")) {
+              serverPnl = -5.00; // Reflect hard SL loss when stopped out on server
+            } else {
+              console.error(`⚠️ Failed to close contract on Deriv: ${errDesc}`);
+              await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Warning\n\nFailed to close contract \`${openTrade.contractId}\` on Deriv: ${errDesc}. Retrying next scan.`);
+              return; // Abort local closure so it retries!
+            }
+          } else if (typeof closeRes.sell?.profit === 'number') {
             serverPnl = closeRes.sell.profit;
           }
         } catch (e) {
@@ -670,7 +681,7 @@ async function runScanMode() {
   // ── Signal Scan (Strict Phase A Fresh H1 Cross + Stateful Phase B TDI/CCI Engine) ──
   const candles = await fetchCandles(M5, 120);
   if (!candles || candles.length < 60) { console.log("Not enough M5 candles."); return; }
-  const i = candles.length - 1; // <--- UPDATED TO length - 1 (Real-time M5 evaluation)
+  const i = candles.length - 1; // Real-time M5 evaluation
   const currentCandleEpoch = candles[i].epoch;
   const closes = candles.map(c => parseFloat(c.close));
 
@@ -695,7 +706,7 @@ async function runScanMode() {
   const h1Candles = await fetchCandles(H1, 100);
   let h1Dir = null, h1Epoch = null, h1FreshCross = false;
   if (h1Candles && h1Candles.length >= 52) {
-    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 1; // <--- UPDATED TO length - 1 (Real-time H1 evaluation)
+    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 1; // Real-time H1 evaluation
     const smaFast1h = sma(h1Closes, 2), smaSlow1h = sma(h1Closes, 50);
     if (smaFast1h[h1ci] != null && smaSlow1h[h1ci] != null && smaFast1h[h1ci-1] != null && smaSlow1h[h1ci-1] != null) {
       if (smaFast1h[h1ci] > smaSlow1h[h1ci]) h1Dir = "BUY";
@@ -705,7 +716,7 @@ async function runScanMode() {
       const crossedDown = (smaFast1h[h1ci-1] >= smaSlow1h[h1ci-1]) && (smaFast1h[h1ci] < smaSlow1h[h1ci]);
       if (crossedUp || crossedDown) h1FreshCross = true;
     }
-    h1Epoch = h1Candles[h1Candles.length - 1].epoch; // <--- UPDATED TO length - 1
+    h1Epoch = h1Candles[h1Candles.length - 1].epoch;
   }
 
   // Evaluate M15 Trend Direction (MACD 3, 50, 1 signal line vs 0)
@@ -714,7 +725,7 @@ async function runScanMode() {
   if (m15Candles && m15Candles.length >= 60) {
     const m15Closes = m15Candles.map(c => parseFloat(c.close));
     const m15Macd = calculateMACD(m15Closes, 3, 50, 1);
-    const m15si = m15Macd.signalLine.length - 1; // <--- UPDATED TO length - 1 (Real-time M15 evaluation)
+    const m15si = m15Macd.signalLine.length - 1; // Real-time M15 evaluation
     if (m15Macd.signalLine[m15si] != null) {
       if (m15Macd.signalLine[m15si] > 0) m15Dir = "BUY";
       else if (m15Macd.signalLine[m15si] < 0) m15Dir = "SELL";
@@ -723,6 +734,12 @@ async function runScanMode() {
 
   // ── HARD HIGHER-TIMEFRAME TREND GATE ─────────────────────────────────
   const h1m15Aligned = h1Dir && m15Dir && (h1Dir === m15Dir);
+  
+  // Detect Realignment Event for Phase C
+  const wasPreviouslyAligned = state.h1m15WasAligned ?? false;
+  const justRealigned = !wasPreviouslyAligned && h1m15Aligned;
+  state.h1m15WasAligned = h1m15Aligned;
+
   if (!h1m15Aligned) {
     dbg("H1 and M15 trend alignment missing or conflicting. Resetting all setups.");
     state.waitingFor = null;
@@ -755,6 +772,21 @@ async function runScanMode() {
       } else if (h1Dir === "SELL" && cci[i] < 90) {
         m5Ready = true;
         entryType = 'PHASE_A';
+      }
+    }
+  }
+
+  // ── PHASE C: HIGHER-TIMEFRAME REALIGNMENT ENTRY ──────────────────────
+  if (!m5Ready && justRealigned && state.phaseCTriggeredEpoch !== currentCandleEpoch) {
+    const mblVal = tdi.middle[i];
+    const m5Aligned = (mblVal != null && rsi[i] != null) && ((h1Dir === "BUY" && rsi[i] > mblVal) || (h1Dir === "SELL" && rsi[i] < mblVal));
+    if (m5Aligned) {
+      if (h1Dir === "BUY" && cci[i] > -114.4) {
+        m5Ready = true;
+        entryType = 'PHASE_C';
+      } else if (h1Dir === "SELL" && cci[i] < 90) {
+        m5Ready = true;
+        entryType = 'PHASE_C';
       }
     }
   }
@@ -886,8 +918,8 @@ async function runScanMode() {
   const h4Bearish = parseFloat(h4Candle.close) < parseFloat(h4Candle.open);
   const d1Ctx = await getD1Context();
 
-  const bypassH4ForPhaseA = (state.activeEntryType === 'PHASE_A');
-  const buySignal = state.waitingFor === "BUY" && (bypassH4ForPhaseA || h4Bullish);
+  const bypassH4ForPhaseAOrC = (state.activeEntryType === 'PHASE_A' || state.activeEntryType === 'PHASE_C');
+  const buySignal = state.waitingFor === "BUY" && (bypassH4ForPhaseAOrC || h4Bullish);
   const sellSignal = state.waitingFor === "SELL" && (bypassH4ForPhaseA || h4Bearish);
 
   let signalTriggered = false, direction = "", entry, sl, risk, tp1, tp2, tp3;
@@ -919,7 +951,7 @@ async function runScanMode() {
     const h4Dir = h4Bullish ? "🟢 BULLISH" : "🔴 BEARISH";
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole) → trail with CCI zero-cross\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | TP1: ${tp1.toFixed(4)} | TP2: ${tp2.toFixed(4)}\n📊 Risk: ${risk.toFixed(2)} points\n️ H4: ${h4Dir} ✅ Direction confirmed\n⚡ Setup: Strict Fresh H1 Cross + Stateful TDI Engine (${state.activeEntryType})\n🏷️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n🌍 *D1 CANDLE STATUS*\n━━━━━━━━━━━━━━━━━━━━\n`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole) → trail with CCI zero-cross\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars} | TP1: ${tp1.toFixed(4)} | TP2: ${tp2.toFixed(4)}\n📊 Risk: ${risk.toFixed(2)} points\n️ H4: ${h4Dir} ✅ Direction confirmed\n⚡ Setup: Strict Signal + Stateful TDI Engine (${state.activeEntryType})\n🏷️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n🌍 *D1 CANDLE STATUS*\n━━━━━━━━━━━━━━━━━━━━\n`;
     if (d1Ctx) message += `Direction: ${d1Ctx.direction}\nD1 Open: ${d1Ctx.open.toFixed(4)}\nD1 Current: ${d1Ctx.close.toFixed(4)}\nMovement: ${d1Ctx.change.toFixed(4)} pts (${d1Ctx.changePct.toFixed(2)}%)\nAlignment: ${alignment}\n\n`;
     else message += `⚠️ D1 data unavailable\n\n`;
     message += `⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
@@ -951,6 +983,9 @@ async function runScanMode() {
 
     if (state.activeEntryType === 'PHASE_A') {
       state.phaseATriggeredEpoch = h1Epoch; // Lock Phase A so it only triggers once per fresh H1 cross
+    }
+    if (state.activeEntryType === 'PHASE_C') {
+      state.phaseCTriggeredEpoch = currentCandleEpoch; // Lock Phase C so it only triggers once per realignment event
     }
     state.waitingFor = null;
     state.setupEpoch = null;
