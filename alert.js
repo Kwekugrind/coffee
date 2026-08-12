@@ -1037,6 +1037,11 @@ async function runScanMode() {
 
 // ==================== EXECUTION MODES ====================
 (async () => {
+  // RANDOM STARTUP JITTER: Stagger execution across repos to prevent HTTP 429 bursts
+  const jitterMs = Math.floor(Math.random() * 12000) + 3000; // 3 to 15 seconds delay
+  dbg(`Staggering execution by ${jitterMs}ms to avoid rate limits...`);
+  await new Promise(r => setTimeout(r, jitterMs));
+
   if (MODE === "daily") { await runSummary("Daily"); return; }
   if (MODE === "weekly") { await runSummary("Weekly"); return; }
   if (MODE === "monthly") { await runSummary("Monthly"); return; }
