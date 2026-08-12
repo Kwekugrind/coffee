@@ -202,11 +202,17 @@ function openWS() {
   });
 }
 
-async function withRetry(fn, retries = 3, delay = 2000) {
+// Smart 429 RateLimit Backoff
+async function withRetry(fn, retries = 3, delay = 3000) {
   for (let i = 0; i < retries; i++) {
-    try { return await fn(); } catch (e) {
+    try { 
+      return await fn(); 
+    } catch (e) { 
+      const isRateLimit = e.message.includes("429") || e.message.includes("RateLimit");
       if (i === retries - 1) throw e;
-      await new Promise(r => setTimeout(r, delay));
+      const currentDelay = isRateLimit ? delay * (i + 2) : delay;
+      dbg(`Retry ${i+1}/${retries} after error: ${e.message}. Waiting ${currentDelay}ms...`);
+      await new Promise(r => setTimeout(r, currentDelay));
     }
   }
 }
@@ -682,6 +688,8 @@ async function runScanMode() {
   // ── Signal Scan (Strict Phase A Fresh H1 Cross + Stateful Phase B TDI/CCI Engine) ──
   const candles = await fetchCandles(M5, 120);
   if (!candles || candles.length < 60) { console.log("Not enough M5 candles."); return; }
+  await new Promise(r => setTimeout(r, 600)); // Pacing delay
+
   const i = candles.length - 1; // Real-time M5 evaluation
   const currentCandleEpoch = candles[i].epoch;
   const closes = candles.map(c => parseFloat(c.close));
@@ -703,8 +711,9 @@ async function runScanMode() {
     if (rsi[i] >= tdi.upper[i]) state.rsiUpperBreakSeen = true;
   }
 
-  // Evaluate H1 Trend Direction & Fresh Cross (FIXED: length - 2 for closed H1 candles)
+  // Evaluate H1 Trend Direction & Fresh Cross (Closed H1 candles)
   const h1Candles = await fetchCandles(H1, 100);
+  await new Promise(r => setTimeout(r, 600)); // Pacing delay
   let h1Dir = null, h1Epoch = null, h1FreshCross = false;
   if (h1Candles && h1Candles.length >= 52) {
     const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 2; 
@@ -720,8 +729,9 @@ async function runScanMode() {
     h1Epoch = h1Candles[h1Candles.length - 2].epoch;
   }
 
-  // Evaluate M15 Trend Direction (FIXED: length - 2 for closed M15 candles)
+  // Evaluate M15 Trend Direction (Closed M15 candles)
   const m15Candles = await fetchCandles(M15, 100);
+  await new Promise(r => setTimeout(r, 600)); // Pacing delay
   let m15Dir = null;
   if (m15Candles && m15Candles.length >= 60) {
     const m15Closes = m15Candles.map(c => parseFloat(c.close));
