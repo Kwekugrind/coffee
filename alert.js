@@ -703,11 +703,11 @@ async function runScanMode() {
     if (rsi[i] >= tdi.upper[i]) state.rsiUpperBreakSeen = true;
   }
 
-  // Evaluate H1 Trend Direction & Fresh Cross
+  // Evaluate H1 Trend Direction & Fresh Cross (FIXED: length - 2 for closed H1 candles)
   const h1Candles = await fetchCandles(H1, 100);
   let h1Dir = null, h1Epoch = null, h1FreshCross = false;
   if (h1Candles && h1Candles.length >= 52) {
-    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 1; // Real-time H1 evaluation
+    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 2; 
     const smaFast1h = sma(h1Closes, 2), smaSlow1h = sma(h1Closes, 50);
     if (smaFast1h[h1ci] != null && smaSlow1h[h1ci] != null && smaFast1h[h1ci-1] != null && smaSlow1h[h1ci-1] != null) {
       if (smaFast1h[h1ci] > smaSlow1h[h1ci]) h1Dir = "BUY";
@@ -717,16 +717,16 @@ async function runScanMode() {
       const crossedDown = (smaFast1h[h1ci-1] >= smaSlow1h[h1ci-1]) && (smaFast1h[h1ci] < smaSlow1h[h1ci]);
       if (crossedUp || crossedDown) h1FreshCross = true;
     }
-    h1Epoch = h1Candles[h1Candles.length - 1].epoch;
+    h1Epoch = h1Candles[h1Candles.length - 2].epoch;
   }
 
-  // Evaluate M15 Trend Direction (MACD 3, 50, 1 signal line vs 0)
+  // Evaluate M15 Trend Direction (FIXED: length - 2 for closed M15 candles)
   const m15Candles = await fetchCandles(M15, 100);
   let m15Dir = null;
   if (m15Candles && m15Candles.length >= 60) {
     const m15Closes = m15Candles.map(c => parseFloat(c.close));
     const m15Macd = calculateMACD(m15Closes, 3, 50, 1);
-    const m15si = m15Macd.signalLine.length - 1; // Real-time M15 evaluation
+    const m15si = m15Macd.signalLine.length - 2; 
     if (m15Macd.signalLine[m15si] != null) {
       if (m15Macd.signalLine[m15si] > 0) m15Dir = "BUY";
       else if (m15Macd.signalLine[m15si] < 0) m15Dir = "SELL";
@@ -736,10 +736,14 @@ async function runScanMode() {
   // ── HARD HIGHER-TIMEFRAME TREND GATE ─────────────────────────────────
   const h1m15Aligned = h1Dir && m15Dir && (h1Dir === m15Dir);
   
-  // Detect Realignment Event for Phase C
-  const wasPreviouslyAligned = state.h1m15WasAligned ?? false;
-  const justRealigned = !wasPreviouslyAligned && h1m15Aligned;
-  state.h1m15WasAligned = h1m15Aligned;
+  // Detect Realignment Event for Phase C (Guarded against first-boot false triggers)
+  let justRealigned = false;
+  if (state.h1m15WasAligned === undefined || state.h1m15WasAligned === null) {
+    state.h1m15WasAligned = h1m15Aligned; 
+  } else {
+    justRealigned = !state.h1m15WasAligned && h1m15Aligned;
+    state.h1m15WasAligned = h1m15Aligned;
+  }
 
   if (!h1m15Aligned) {
     dbg("H1 and M15 trend alignment missing or conflicting. Resetting all setups.");
