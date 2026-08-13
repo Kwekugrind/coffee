@@ -1,18 +1,18 @@
 {
   "waitingFor": null,
   "setupEpoch": null,
-  "lastProcessedEpoch": 1786615800,
+  "lastProcessedEpoch": 1786616100,
   "lastTgUpdateId": 16871120,
-  "h1TrendEpoch": 1786608000,
+  "h1TrendEpoch": 1786611600,
   "phaseATriggeredEpoch": 1786384800,
-  "phaseCTriggeredEpoch": 1786590300,
+  "phaseCTriggeredEpoch": 1786616100,
   "phaseDTriggeredEpoch": null,
   "activeEntryType": null,
   "anticipatedTrend": null,
   "pendingPullback": null,
   "pullbackEpoch": null,
   "pullbackTrigger": null,
-  "rsiLowerBreakSeen": true,
+  "rsiLowerBreakSeen": false,
   "rsiUpperBreakSeen": false,
-  "h1m15WasAligned": false
+  "h1m15WasAligned": true
 }
