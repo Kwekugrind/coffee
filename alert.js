@@ -29,7 +29,6 @@ const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const R
 const TRADING_SYMBOL = SYMBOL;
 const STAKE_USD = 10;
 const RISK_REWARD = 1.5;
-const SAFETY_TP_USD = 15.00; // $15 flat profit insurance ceiling on broker side
 const BREAKEVEN_ACTIVATE_USD = 3.00; // Move SL to entry once profit hits $3.00
 const ATR_PERIOD = 14;
 const ATR_MULTIPLIER = 2.0; // Stop loss breathing room
@@ -334,7 +333,7 @@ async function executeTrade(direction) {
       multiplier: MULTIPLIER,
       limit_order: {
         stop_loss: slDollars,
-        take_profit: SAFETY_TP_USD // Restored $15.00 flat profit insurance ceiling on broker side
+        take_profit: SAFETY_TP_USD // $15.00 flat profit insurance ceiling on broker side
       }
     }
   };
@@ -719,13 +718,21 @@ async function runScanMode() {
       await sendTelegram(`⚖️ *${REPO_LABEL} — Breakeven Armed*\nProfit reached $${BREAKEVEN_ACTIVATE_USD.toFixed(2)}. Price floor locked at entry (${openTrade.entry.toFixed(4)}).`);
     }
 
-    // BREAKEVEN PRICE TRIGGER: Close immediately if price reverses to entry
+    // COMMISSION-COVERED BREAKEVEN TRIGGER: Close early to lock in +$0.50 net profit (covering commissions)
+    const targetNetProfit = 0.50;
+    const requiredRawPnl = targetNetProfit + COMMISSION_USD;
+    const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
+    
+    const breakevenPrice = openTrade.direction === "BUY" 
+      ? openTrade.entry * (1 + priceMoveFraction) 
+      : openTrade.entry * (1 - priceMoveFraction);
+
     const breakevenHit = openTrade.breakevenSet && !openTrade.tp1Reached && (
-      (openTrade.direction === "BUY" && currentPrice <= openTrade.entry) ||
-      (openTrade.direction === "SELL" && currentPrice >= openTrade.entry)
+      (openTrade.direction === "BUY" && currentPrice <= breakevenPrice) ||
+      (openTrade.direction === "SELL" && currentPrice >= breakevenPrice)
     );
     if (breakevenHit) {
-      await closeWith("WIN", `Breakeven exit — price reversed back to entry (${openTrade.entry.toFixed(4)}) after hitting profit target`);
+      await closeWith("WIN", `Commission-Covered Breakeven exit — locked +$0.50 net profit at price ${breakevenPrice.toFixed(4)}`);
       return;
     }
 
