@@ -34,8 +34,8 @@ const BREAKEVEN_ACTIVATE_USD = 3.00; // Move SL to entry once profit hits $3.00
 const ATR_PERIOD = 14;
 const ATR_MULTIPLIER = 2.0; // Stop loss breathing room
 const SETUP_EXPIRY_BARS = 35;
-const MARKET_DATA_APP_ID = "1089";
-const DERIV_APP_ID = process.env.DERIV_APP_ID || "67418";
+const MARKET_DATA_APP_ID = "1089"; // Dedicated public App ID for unauthenticated candle data
+const DERIV_APP_ID = process.env.DERIV_APP_ID || "67418"; // Personal App ID for trading/OTP
 const TG_TOKEN = process.env.TG_BOT_TOKEN || process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const DERIV_TOKEN = process.env.DERIV_API_TOKEN;
@@ -323,7 +323,6 @@ async function executeTrade(direction) {
   const wsUrl = await getDerivOTP(accountId);
   const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
   const tpValue = typeof SAFETY_TP_USD !== 'undefined' ? SAFETY_TP_USD : 15.00;
-  
   const params = {
     buy: "1",
     price: STAKE_USD,
