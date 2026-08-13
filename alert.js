@@ -130,8 +130,7 @@ async function executeManualClose(result, reason) {
   const open = trades.filter(t => !t.result);
   if (!open.length) { await sendTelegram(`⚠️ *${REPO_LABEL}*\n\nNo open trade found to close.`); return; }
   for (const trade of open) {
-    const tradeData = await fetchOpenTradeData();
-    const currentPrice = tradeData.price;
+    const currentPrice = await getCurrentPrice(trade.symbol);
     
     let serverPnl = calcUnrealizedPnL(trade, currentPrice);
     if (trade.contractId) { 
@@ -492,7 +491,7 @@ function getBGAInfo(price) {
   return `BGA Zone (Near ${whole})`;
 }
 
-async function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
+function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
   let step = 100;
   if (entry > 20000) step = 500;
   else if (entry > 10000) step = 200;
@@ -662,6 +661,54 @@ async function runScanMode() {
       
       await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
     };
+
+    // EARLY FAKEOUT DEFENSE: If price immediately fails before breakeven/TP1
+    if (!openTrade.tp1Reached && !openTrade.breakevenSet) {
+      const m5CandlesExit = tradeData.candles;
+      if (m5CandlesExit && m5CandlesExit.length >= 36) {
+        const closesExit = m5CandlesExit.map(c => parseFloat(c.close));
+        const cciExit = calculateCCI(m5CandlesExit, 34);
+        const rsiExit = calculateRSI(closesExit, 14);
+        const tdiExit = calculateBollingerBands(rsiExit, 34, 1.619);
+        
+        const ie = cciExit.length - 2;
+        const iePrev = cciExit.length - 3;
+
+        if (ie >= 0 && iePrev >= 0) {
+          const c1Close = closesExit[ie];
+          const c2Close = closesExit[iePrev];
+          
+          let twoCandlesAgainst = false;
+          if (openTrade.direction === "BUY") {
+            twoCandlesAgainst = (c1Close < openTrade.entry && c2Close < openTrade.entry);
+          } else {
+            twoCandlesAgainst = (c1Close > openTrade.entry && c2Close > openTrade.entry);
+          }
+
+          const rsiCurr = rsiExit[ie], rsiPrev = rsiExit[iePrev];
+          const upperCurr = tdiExit.upper[ie], lowerCurr = tdiExit.lower[ie];
+          
+          let tdiReversedInside = false;
+          if (openTrade.direction === "BUY") {
+            tdiReversedInside = (rsiPrev >= upperCurr || rsiPrev >= 70) && (rsiCurr < upperCurr);
+          } else {
+            tdiReversedInside = (rsiPrev <= lowerCurr || rsiPrev <= 30) && (rsiCurr > lowerCurr);
+          }
+
+          let cciFakeoutCross = false;
+          if (openTrade.direction === "BUY") {
+            cciFakeoutCross = (cciExit[iePrev] <= -114.4 && cciExit[ie] > -114.4) || (cciExit[iePrev] >= 90 && cciExit[ie] < 90);
+          } else {
+            cciFakeoutCross = (cciExit[iePrev] >= 90 && cciExit[ie] < 90) || (cciExit[iePrev] <= -114.4 && cciExit[ie] > -114.4);
+          }
+
+          if (twoCandlesAgainst && (tdiReversedInside || cciFakeoutCross)) {
+            await closeWith("LOSS", `Early fakeout exit — 2 candles closed against entry with indicator reversal`);
+            return;
+          }
+        }
+      }
+    }
 
     // BREAKEVEN PROTECTION: Arm once profit hits $3.00
     if (!openTrade.tp1Reached && !openTrade.breakevenSet && pnl >= BREAKEVEN_ACTIVATE_USD) {
@@ -1038,7 +1085,7 @@ async function runScanMode() {
   if (signalTriggered) {
     const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
     
-    // Calculate BGA-based TP1 (Strict Whole Number), TP2 (Ultimate TP / Half Number), and TP3 bounded by D1 Fib Range
+    // Calculate BGA-based TP1 (Strict Whole Number), TP2 (Ultimate TP / Half Number), and TP3 bounded by D1 Fib Range (261.8%)
     const bgaTps = await calculateBgaTakeProfits(entry, direction, atr14, d1Candles);
     tp1 = bgaTps.tp1;
     tp2 = bgaTps.tp2;
