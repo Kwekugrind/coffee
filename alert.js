@@ -130,7 +130,8 @@ async function executeManualClose(result, reason) {
   const open = trades.filter(t => !t.result);
   if (!open.length) { await sendTelegram(`⚠️ *${REPO_LABEL}*\n\nNo open trade found to close.`); return; }
   for (const trade of open) {
-    const currentPrice = await getCurrentPrice(trade.symbol);
+    const tradeData = await fetchOpenTradeData();
+    const currentPrice = tradeData.price;
     
     let serverPnl = calcUnrealizedPnL(trade, currentPrice);
     if (trade.contractId) { 
@@ -203,7 +204,7 @@ function openWS() {
 }
 
 // Smart 429 RateLimit Backoff
-async function withRetry(fn, retries = 3, delay = 3000) {
+async function withRetry(fn, retries = 3, delay = 4000) {
   for (let i = 0; i < retries; i++) {
     try { 
       return await fn(); 
@@ -217,35 +218,69 @@ async function withRetry(fn, retries = 3, delay = 3000) {
   }
 }
 
-async function fetchCandles(granularity, count = 100) {
+// CONSOLIDATED DATA FETCHER (Opens ONE single WebSocket connection instead of 5 separate ones)
+async function fetchAllData() {
   return withRetry(async () => {
-    const ws = await openWS();
     return new Promise((resolve, reject) => {
-      ws.send(JSON.stringify({ ticks_history: SYMBOL, granularity, count, end: "latest", style: "candles" }));
-      ws.on("message", d => {
-        const msg = JSON.parse(d); ws.close();
-        if (msg.candles) resolve(msg.candles);
-        else reject(new Error("No candles: " + JSON.stringify(msg)));
+      const ws = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${MARKET_DATA_APP_ID}`);
+      const results = {};
+      
+      ws.on("open", () => {
+        ws.send(JSON.stringify({ req_id: 1, ticks_history: SYMBOL, granularity: M5, count: 120, end: "latest", style: "candles" }));
+        ws.send(JSON.stringify({ req_id: 2, ticks_history: SYMBOL, granularity: H1, count: 100, end: "latest", style: "candles" }));
+        ws.send(JSON.stringify({ req_id: 3, ticks_history: SYMBOL, granularity: M15, count: 100, end: "latest", style: "candles" }));
+        ws.send(JSON.stringify({ req_id: 4, ticks_history: SYMBOL, granularity: H4, count: 10, end: "latest", style: "candles" }));
+        ws.send(JSON.stringify({ req_id: 5, ticks_history: SYMBOL, granularity: D1, count: 5, end: "latest", style: "candles" }));
       });
-      setTimeout(() => { ws.close(); reject(new Error("fetchCandles timeout")); }, 20000);
+
+      ws.on("message", d => {
+        const msg = JSON.parse(d);
+        if (msg.req_id === 1) results.m5 = msg.candles;
+        if (msg.req_id === 2) results.h1 = msg.candles;
+        if (msg.req_id === 3) results.m15 = msg.candles;
+        if (msg.req_id === 4) results.h4 = msg.candles;
+        if (msg.req_id === 5) results.d1 = msg.candles;
+
+        if (results.m5 && results.h1 && results.m15 && results.h4 && results.d1) {
+          ws.close();
+          resolve(results);
+        }
+      });
+
+      ws.on("error", (err) => { ws.close(); reject(err); });
+      setTimeout(() => { ws.close(); reject(new Error("fetchAllData timeout")); }, 20000);
+    });
+  });
+}
+
+// CONSOLIDATED OPEN TRADE FETCHER (Price + Exit Candles in ONE connection)
+async function fetchOpenTradeData() {
+  return withRetry(async () => {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${MARKET_DATA_APP_ID}`);
+      const results = {};
+      ws.on("open", () => {
+        ws.send(JSON.stringify({ req_id: 1, ticks_history: SYMBOL, granularity: M5, count: 50, end: "latest", style: "candles" }));
+        ws.send(JSON.stringify({ req_id: 2, ticks_history: SYMBOL, count: 1, end: "latest", style: "ticks" }));
+      });
+      ws.on("message", d => {
+        const msg = JSON.parse(d);
+        if (msg.req_id === 1) results.candles = msg.candles;
+        if (msg.req_id === 2) results.price = msg.history?.prices?.[msg.history.prices.length - 1];
+        if (results.candles && results.price !== undefined) {
+          ws.close();
+          resolve(results);
+        }
+      });
+      ws.on("error", (err) => { ws.close(); reject(err); });
+      setTimeout(() => { ws.close(); reject(new Error("fetchOpenTradeData timeout")); }, 15000);
     });
   });
 }
 
 async function getCurrentPrice(sym = SYMBOL) {
-  return withRetry(async () => {
-    const ws = await openWS();
-    return new Promise((resolve, reject) => {
-      ws.send(JSON.stringify({ ticks_history: sym, count: 1, end: "latest", style: "ticks" }));
-      ws.on("message", d => {
-        const msg = JSON.parse(d); ws.close();
-        if (msg.history?.prices?.length)
-          resolve(parseFloat(msg.history.prices[msg.history.prices.length - 1]));
-        else reject(new Error("No price: " + JSON.stringify(msg)));
-      });
-      setTimeout(() => { ws.close(); reject(new Error("getCurrentPrice timeout")); }, 10000);
-    });
-  });
+  const data = await fetchOpenTradeData();
+  return data.price;
 }
 
 async function getDerivAccountId() {
@@ -457,7 +492,7 @@ function getBGAInfo(price) {
   return `BGA Zone (Near ${whole})`;
 }
 
-async function calculateBgaTakeProfits(entry, direction, atr14) {
+async function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
   let step = 100;
   if (entry > 20000) step = 500;
   else if (entry > 10000) step = 200;
@@ -472,26 +507,20 @@ async function calculateBgaTakeProfits(entry, direction, atr14) {
   // Minimum distance buffer to prevent micro-targets (at least 20% of step or 1.2 * ATR)
   const minBuffer = Math.max(step * 0.20, atr14 * 1.2);
 
-  // Fetch previous day candle for Fibonacci Range & Extension Projection
+  // Fibonacci Daily Range Extension Limit (261.8%)
   let fibMaxLimit = null;
-  try {
-    const d1Candles = await fetchCandles(D1, 5);
-    if (d1Candles && d1Candles.length >= 2) {
-      const prevDay = d1Candles[d1Candles.length - 2];
-      const prevHigh = parseFloat(prevDay.high);
-      const prevLow = parseFloat(prevDay.low);
-      const prevRange = prevHigh - prevLow;
-      
-      if (prevRange > 0) {
-        if (direction === "BUY") {
-          fibMaxLimit = prevHigh + (prevRange * 1.618);
-        } else {
-          fibMaxLimit = prevLow - (prevRange * 1.618);
-        }
+  if (d1Candles && d1Candles.length >= 2) {
+    const prevDay = d1Candles[d1Candles.length - 2];
+    const prevHigh = parseFloat(prevDay.high);
+    const prevLow = parseFloat(prevDay.low);
+    const prevRange = prevHigh - prevLow;
+    if (prevRange > 0) {
+      if (direction === "BUY") {
+        fibMaxLimit = prevHigh + (prevRange * 2.618);
+      } else {
+        fibMaxLimit = prevLow - (prevRange * 2.618);
       }
     }
-  } catch (e) {
-    dbg("Fib range calculation fallback:", e.message);
   }
 
   // Generate the full fine grid (Whole and Half numbers) for sequencing
@@ -515,10 +544,7 @@ async function calculateBgaTakeProfits(entry, direction, atr14) {
 
     // 2. TP2 and TP3 are the next immediate BGA levels (Half then Whole) after TP1
     let futureLevels = allLevels.filter(l => l > tp1).sort((a, b) => a - b);
-
-    if (fibMaxLimit) {
-      futureLevels = futureLevels.filter(l => l <= fibMaxLimit);
-    }
+    if (fibMaxLimit) futureLevels = futureLevels.filter(l => l <= fibMaxLimit);
 
     let tp2 = futureLevels[0] || tp1 + halfStep;
     let tp3 = futureLevels[1] || tp1 + step;
@@ -542,10 +568,7 @@ async function calculateBgaTakeProfits(entry, direction, atr14) {
     const tp1 = validTp1 || (baseWhole - step);
 
     let futureLevels = allLevels.filter(l => l < tp1).sort((a, b) => b - a);
-
-    if (fibMaxLimit) {
-      futureLevels = futureLevels.filter(l => l >= fibMaxLimit);
-    }
+    if (fibMaxLimit) futureLevels = futureLevels.filter(l => l >= fibMaxLimit);
 
     let tp2 = futureLevels[0] || tp1 - halfStep;
     let tp3 = futureLevels[1] || tp1 - step;
@@ -572,7 +595,7 @@ async function getD1Context() {
     const c = candles[candles.length - 2];
     const open = parseFloat(c.open), close = parseFloat(c.close);
     const change = close - open, changePct = (change / open) * 100;
-    return { direction: close > open ? "🟢 BULLISH" : "🔴 BEARISH", open, close, change, changePct };
+    return { direction: close > open ? "🟢 BULLISH" : "🔴 BEARISH", open, close, change, changePct, candles };
   } catch (e) { console.error("getD1Context error:", e.message); return null; }
 }
 
@@ -595,7 +618,8 @@ async function runScanMode() {
   // ── Open Position Management ──────────────────────────────────────────
   const openTrade = trades.find(t => !t.result);
   if (openTrade) {
-    const currentPrice = await getCurrentPrice();
+    const tradeData = await fetchOpenTradeData();
+    const currentPrice = tradeData.price;
     const pnl = calcUnrealizedPnL(openTrade, currentPrice);
     dbg(`Open trade PnL: ${pnl.toFixed(4)}`);
 
@@ -695,7 +719,7 @@ async function runScanMode() {
     }
 
     // 5. Momentum Trailing Exit: M5 CCI crosses zero line against position
-    const m5CandlesExit = await fetchCandles(M5, 50);
+    const m5CandlesExit = tradeData.candles;
     if (m5CandlesExit && m5CandlesExit.length >= 36) {
       const cciExit = calculateCCI(m5CandlesExit, 34);
       const ie = cciExit.length - 2;
@@ -719,10 +743,14 @@ async function runScanMode() {
     return;
   }
 
-  // ── Signal Scan (Strict Phase A Fresh H1 Cross + Stateful Phase B TDI/CCI Engine) ──
-  const candles = await fetchCandles(M5, 120);
+  // ── Signal Scan (Consolidated Data Fetching - ONE Single WebSocket Handshake) ──
+  const scanData = await fetchAllData();
+  const candles = scanData.m5;
+  const h1Candles = scanData.h1;
+  const m15Candles = scanData.m15;
+  const d1Candles = scanData.d1;
+
   if (!candles || candles.length < 60) { console.log("Not enough M5 candles."); return; }
-  await new Promise(r => setTimeout(r, 600)); // Pacing delay
 
   const i = candles.length - 1; // Real-time M5 evaluation
   const currentCandleEpoch = candles[i].epoch;
@@ -746,8 +774,6 @@ async function runScanMode() {
   }
 
   // Evaluate H1 Trend Direction & Fresh Cross (Closed H1 candles)
-  const h1Candles = await fetchCandles(H1, 100);
-  await new Promise(r => setTimeout(r, 600)); // Pacing delay
   let h1Dir = null, h1Epoch = null, h1FreshCross = false;
   if (h1Candles && h1Candles.length >= 52) {
     const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 2; 
@@ -764,8 +790,6 @@ async function runScanMode() {
   }
 
   // Evaluate M15 Trend Direction (Closed M15 candles)
-  const m15Candles = await fetchCandles(M15, 100);
-  await new Promise(r => setTimeout(r, 600)); // Pacing delay
   let m15Dir = null;
   if (m15Candles && m15Candles.length >= 60) {
     const m15Closes = m15Candles.map(c => parseFloat(c.close));
@@ -986,11 +1010,19 @@ async function runScanMode() {
     }
   }
 
-  const h4Candle = await fetchH4Candle();
+  const h4Candle = scanData.h4[scanData.h4.length - 2];
   if (!h4Candle) { state.lastProcessedEpoch = currentCandleEpoch; fs.writeFileSync("state.json", JSON.stringify(state, null, 2)); return; }
   const h4Bullish = parseFloat(h4Candle.close) > parseFloat(h4Candle.open);
   const h4Bearish = parseFloat(h4Candle.close) < parseFloat(h4Candle.open);
-  const d1Ctx = await getD1Context();
+  
+  const prevD1 = d1Candles[d1Candles.length - 2];
+  const d1Ctx = {
+    direction: parseFloat(prevD1.close) > parseFloat(prevD1.open) ? "🟢 BULLISH" : "🔴 BEARISH",
+    open: parseFloat(prevD1.open),
+    close: parseFloat(prevD1.close),
+    change: parseFloat(prevD1.close) - parseFloat(prevD1.open),
+    changePct: ((parseFloat(prevD1.close) - parseFloat(prevD1.open)) / parseFloat(prevD1.open)) * 100
+  };
 
   const bypassH4ForPhaseAOrCOrD = (state.activeEntryType === 'PHASE_A' || state.activeEntryType === 'PHASE_C' || state.activeEntryType === 'PHASE_D');
   const buySignal = state.waitingFor === "BUY" && (bypassH4ForPhaseAOrCOrD || h4Bullish);
@@ -1007,7 +1039,7 @@ async function runScanMode() {
     const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
     
     // Calculate BGA-based TP1 (Strict Whole Number), TP2 (Ultimate TP / Half Number), and TP3 bounded by D1 Fib Range
-    const bgaTps = await calculateBgaTakeProfits(entry, direction, atr14);
+    const bgaTps = await calculateBgaTakeProfits(entry, direction, atr14, d1Candles);
     tp1 = bgaTps.tp1;
     tp2 = bgaTps.tp2;
     tp3 = bgaTps.tp3;
