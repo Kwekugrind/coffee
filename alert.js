@@ -12,10 +12,10 @@ import fs from "fs";
 // const SYMBOL = "R_50"; const SYMBOL_NAME = "Volatility 50 Index"; const REPO_LABEL = "OmniSight (V50)"; const MULTIPLIER = 80; const COMMISSION_USD = 0.16;
 
 // --- 3. Lery's Alerts (Demo) ---
-// const SYMBOL = "R_75"; const SYMBOL_NAME = "Volatility 75 Index"; const REPO_LABEL = "Lery's Alerts (V75 Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
+const SYMBOL = "R_75"; const SYMBOL_NAME = "Volatility 75 Index"; const REPO_LABEL = "Lery's Alerts (V75 Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
 
 // --- 4. Coffee (Demo) ---
-const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const REPO_LABEL = "Coffee (V75-1s Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
+// const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const REPO_LABEL = "Coffee (V75-1s Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
 
 // --- 5. Milk (Demo) ---
 // const SYMBOL = "R_100"; const SYMBOL_NAME = "Volatility 100 Index"; const REPO_LABEL = "Milk (V100 Demo)"; const MULTIPLIER = 40; const COMMISSION_USD = 0.15;
@@ -457,7 +457,7 @@ function getBGAInfo(price) {
   return `BGA Zone (Near ${whole})`;
 }
 
-function calculateBgaTakeProfits(entry, direction, atr14) {
+async function calculateBgaTakeProfits(entry, direction, atr14) {
   let step = 100;
   if (entry > 20000) step = 500;
   else if (entry > 10000) step = 200;
@@ -471,6 +471,28 @@ function calculateBgaTakeProfits(entry, direction, atr14) {
 
   // Minimum distance buffer to prevent micro-targets (at least 20% of step or 1.2 * ATR)
   const minBuffer = Math.max(step * 0.20, atr14 * 1.2);
+
+  // Fetch previous day candle for Fibonacci Range & Extension Projection
+  let fibMaxLimit = null;
+  try {
+    const d1Candles = await fetchCandles(D1, 5);
+    if (d1Candles && d1Candles.length >= 2) {
+      const prevDay = d1Candles[d1Candles.length - 2];
+      const prevHigh = parseFloat(prevDay.high);
+      const prevLow = parseFloat(prevDay.low);
+      const prevRange = prevHigh - prevLow;
+      
+      if (prevRange > 0) {
+        if (direction === "BUY") {
+          fibMaxLimit = prevHigh + (prevRange * 1.618);
+        } else {
+          fibMaxLimit = prevLow - (prevRange * 1.618);
+        }
+      }
+    }
+  } catch (e) {
+    dbg("Fib range calculation fallback:", e.message);
+  }
 
   // Generate the full fine grid (Whole and Half numbers) for sequencing
   const allLevels = [];
@@ -492,13 +514,19 @@ function calculateBgaTakeProfits(entry, direction, atr14) {
     const tp1 = validTp1 || (baseWhole + step);
 
     // 2. TP2 and TP3 are the next immediate BGA levels (Half then Whole) after TP1
-    const futureLevels = allLevels.filter(l => l > tp1).sort((a, b) => a - b);
+    let futureLevels = allLevels.filter(l => l > tp1).sort((a, b) => a - b);
 
-    return {
-      tp1: tp1,
-      tp2: futureLevels[0] || tp1 + halfStep,
-      tp3: futureLevels[1] || tp1 + step
-    };
+    if (fibMaxLimit) {
+      futureLevels = futureLevels.filter(l => l <= fibMaxLimit);
+    }
+
+    let tp2 = futureLevels[0] || tp1 + halfStep;
+    let tp3 = futureLevels[1] || tp1 + step;
+
+    if (tp2 <= tp1) tp2 = tp1 + halfStep;
+    if (tp3 <= tp2) tp3 = tp2 + halfStep;
+
+    return { tp1, tp2, tp3 };
 
   } else {
     // SELL direction: TP1 MUST BE A BGA WHOLE NUMBER strictly below entry satisfying minBuffer
@@ -513,13 +541,19 @@ function calculateBgaTakeProfits(entry, direction, atr14) {
     }
     const tp1 = validTp1 || (baseWhole - step);
 
-    const futureLevels = allLevels.filter(l => l < tp1).sort((a, b) => b - a);
+    let futureLevels = allLevels.filter(l => l < tp1).sort((a, b) => b - a);
 
-    return {
-      tp1: tp1,
-      tp2: futureLevels[0] || tp1 - halfStep,
-      tp3: futureLevels[1] || tp1 - step
-    };
+    if (fibMaxLimit) {
+      futureLevels = futureLevels.filter(l => l >= fibMaxLimit);
+    }
+
+    let tp2 = futureLevels[0] || tp1 - halfStep;
+    let tp3 = futureLevels[1] || tp1 - step;
+
+    if (tp2 >= tp1) tp2 = tp1 - halfStep;
+    if (tp3 >= tp2) tp3 = tp2 - halfStep;
+
+    return { tp1, tp2, tp3 };
   }
 }
 
@@ -972,8 +1006,8 @@ async function runScanMode() {
   if (signalTriggered) {
     const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
     
-    // Calculate BGA-based TP1 (Strict Whole Number), TP2 (Ultimate TP / Half Number), and TP3
-    const bgaTps = calculateBgaTakeProfits(entry, direction, atr14);
+    // Calculate BGA-based TP1 (Strict Whole Number), TP2 (Ultimate TP / Half Number), and TP3 bounded by D1 Fib Range
+    const bgaTps = await calculateBgaTakeProfits(entry, direction, atr14);
     tp1 = bgaTps.tp1;
     tp2 = bgaTps.tp2;
     tp3 = bgaTps.tp3;
