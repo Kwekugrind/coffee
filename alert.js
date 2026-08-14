@@ -815,9 +815,10 @@ async function runScanMode() {
     if (rsi[i] >= tdi.upper[i]) state.rsiUpperBreakSeen = true;
   }
 
+  // Evaluate H1 Trend Direction & Fresh Cross (REAL-TIME H1 candle: length - 1)
   let h1Dir = null, h1Epoch = null, h1FreshCross = false;
   if (h1Candles && h1Candles.length >= 52) {
-    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 2;
+    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 1;
     const smaFast1h = sma(h1Closes, 2), smaSlow1h = sma(h1Closes, 50);
     if (smaFast1h[h1ci] != null && smaSlow1h[h1ci] != null && smaFast1h[h1ci-1] != null && smaSlow1h[h1ci-1] != null) {
       if (smaFast1h[h1ci] > smaSlow1h[h1ci]) h1Dir = "BUY";
@@ -826,20 +827,22 @@ async function runScanMode() {
       const crossedDown = (smaFast1h[h1ci-1] >= smaSlow1h[h1ci-1]) && (smaFast1h[h1ci] < smaSlow1h[h1ci]);
       if (crossedUp || crossedDown) h1FreshCross = true;
     }
-    h1Epoch = h1Candles[h1Candles.length - 2].epoch;
+    h1Epoch = h1Candles[h1Candles.length - 1].epoch;
   }
 
+  // Evaluate M15 Trend Direction (REAL-TIME M15 candle: length - 1)
   let m15Dir = null;
   if (m15Candles && m15Candles.length >= 60) {
     const m15Closes = m15Candles.map(c => parseFloat(c.close));
     const m15Macd = calculateMACD(m15Closes, 3, 50, 1);
-    const m15si = m15Macd.signalLine.length - 2;
+    const m15si = m15Macd.signalLine.length - 1;
     if (m15Macd.signalLine[m15si] != null) {
       if (m15Macd.signalLine[m15si] > 0) m15Dir = "BUY";
       else if (m15Macd.signalLine[m15si] < 0) m15Dir = "SELL";
     }
   }
 
+  // ── HARD HIGHER-TIMEFRAME TREND GATE ─────────────────────────────────
   const h1m15Aligned = h1Dir && m15Dir && (h1Dir === m15Dir);
   let justRealigned = false;
   if (state.h1m15WasAligned === undefined || state.h1m15WasAligned === null) {
@@ -869,33 +872,37 @@ async function runScanMode() {
   let m5Ready = false;
   let entryType = null;
 
-  // Phase A
+  // ── PHASE A: STRICTLY A LIVE FRESH H1 CROSS (First Trade) ────────────
   if (h1FreshCross && state.phaseATriggeredEpoch !== h1Epoch) {
     const mblVal = tdi.middle[i];
     const m5Aligned = (mblVal != null && rsi[i] != null) && ((h1Dir === "BUY" && rsi[i] > mblVal) || (h1Dir === "SELL" && rsi[i] < mblVal));
     if (m5Aligned) {
       if (h1Dir === "BUY" && cci[i] > -114.4) {
-        m5Ready = true; entryType = 'PHASE_A';
+        m5Ready = true;
+        entryType = 'PHASE_A';
       } else if (h1Dir === "SELL" && cci[i] < 90) {
-        m5Ready = true; entryType = 'PHASE_A';
+        m5Ready = true;
+        entryType = 'PHASE_A';
       }
     }
   }
 
-  // Phase C
+  // ── PHASE C: HIGHER-TIMEFRAME REALIGNMENT ENTRY ──────────────────────
   if (!m5Ready && justRealigned && state.phaseCTriggeredEpoch !== currentCandleEpoch) {
     const mblVal = tdi.middle[i];
     const m5Aligned = (mblVal != null && rsi[i] != null) && ((h1Dir === "BUY" && rsi[i] > mblVal) || (h1Dir === "SELL" && rsi[i] < mblVal));
     if (m5Aligned) {
       if (h1Dir === "BUY" && cci[i] > -114.4) {
-        m5Ready = true; entryType = 'PHASE_C';
+        m5Ready = true;
+        entryType = 'PHASE_C';
       } else if (h1Dir === "SELL" && cci[i] < 90) {
-        m5Ready = true; entryType = 'PHASE_C';
+        m5Ready = true;
+        entryType = 'PHASE_C';
       }
     }
   }
 
-  // Phase D
+  // ── PHASE D: SHALLOW PULLBACK (TDI Outer Band + MBL Cross + CCI Zero Cross) ──
   if (!m5Ready && h1Dir && m15Dir && (h1Dir === m15Dir) && state.phaseDTriggeredEpoch !== currentCandleEpoch) {
     const mblPrev = tdi.middle[i-1], mblCurr = tdi.middle[i];
     const rsiPrev = rsi[i-1], rsiCurr = rsi[i];
@@ -908,16 +915,22 @@ async function runScanMode() {
     const cciZeroCrossUp = (cci[i-1] <= 0) && (cci[i] > 0);
     const cciZeroCrossDown = (cci[i-1] >= 0) && (cci[i] < 0);
     if (h1Dir === "BUY" && tdiCrossUp && cciZeroCrossUp) {
-      m5Ready = true; entryType = 'PHASE_D';
+      m5Ready = true;
+      entryType = 'PHASE_D';
     } else if (h1Dir === "SELL" && tdiCrossDown && cciZeroCrossDown) {
-      m5Ready = true; entryType = 'PHASE_D';
+      m5Ready = true;
+      entryType = 'PHASE_D';
     }
   }
 
-  // Phase B
+  // ── PHASE B: STATEFUL CROSS-CONFIRMATION ENGINE (Pullbacks / Re-entries) ──
   if (!m5Ready && h1Dir && m15Dir && h1Dir === m15Dir) {
     if (state.pendingPullback && state.pullbackEpoch && (currentCandleEpoch - state.pullbackEpoch) > (SETUP_EXPIRY_BARS * M5)) {
-      state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null; state.rsiLowerBreakSeen = false; state.rsiUpperBreakSeen = false;
+      state.pendingPullback = null;
+      state.pullbackEpoch = null;
+      state.pullbackTrigger = null;
+      state.rsiLowerBreakSeen = false;
+      state.rsiUpperBreakSeen = false;
       console.log("Pending pullback setup expired (35 bars reached).");
     }
     const cciCrossBuy = (cci[i-1] <= -114.4) && (cci[i] > -114.4);
@@ -935,40 +948,58 @@ async function runScanMode() {
       const oppositeTdiCross = (rsiPrev >= mblPrev) && (rsiCurr < mblCurr);
       const oppositeCciCross = (cci[i-1] > -114.4) && (cci[i] <= -114.4);
       if (oppositeTdiCross || oppositeCciCross || h1Dir !== "BUY") {
-        state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null;
+        console.log("Pending BUY pullback invalidated by opposite cross or trend shift.");
+        state.pendingPullback = null;
+        state.pullbackEpoch = null;
+        state.pullbackTrigger = null;
       }
     } else if (state.pendingPullback === "SELL") {
       const oppositeTdiCross = (rsiPrev <= mblPrev) && (rsiCurr > mblCurr);
       const oppositeCciCross = (cci[i-1] < 90) && (cci[i] >= 90);
       if (oppositeTdiCross || oppositeCciCross || h1Dir !== "SELL") {
-        state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null;
+        console.log("Pending SELL pullback invalidated by opposite cross or trend shift.");
+        state.pendingPullback = null;
+        state.pullbackEpoch = null;
+        state.pullbackTrigger = null;
       }
     }
 
     if (state.pendingPullback === "BUY") {
       if (state.pullbackTrigger === "CCI" && tdiCrossUp) {
-        m5Ready = true; entryType = 'PHASE_B'; state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null;
+        m5Ready = true;
+        entryType = 'PHASE_B';
+        state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null;
       } else if (state.pullbackTrigger === "TDI" && cciCrossBuy) {
-        m5Ready = true; entryType = 'PHASE_B'; state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null;
+        m5Ready = true;
+        entryType = 'PHASE_B';
+        state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null;
       }
     } else if (state.pendingPullback === "SELL") {
       if (state.pullbackTrigger === "CCI" && tdiCrossDown) {
-        m5Ready = true; entryType = 'PHASE_B'; state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null;
+        m5Ready = true;
+        entryType = 'PHASE_B';
+        state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null;
       } else if (state.pullbackTrigger === "TDI" && cciCrossSell) {
-        m5Ready = true; entryType = 'PHASE_B'; state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null;
+        m5Ready = true;
+        entryType = 'PHASE_B';
+        state.pendingPullback = null; state.pullbackEpoch = null; state.pullbackTrigger = null;
       }
     } else {
       if (h1Dir === "BUY") {
         if (cciCrossBuy) {
           state.pendingPullback = "BUY"; state.pullbackTrigger = "CCI"; state.pullbackEpoch = currentCandleEpoch;
+          console.log("CCI crossed -114.4 upward first. Waiting for TDI MBL cross.");
         } else if (tdiCrossUp) {
           state.pendingPullback = "BUY"; state.pullbackTrigger = "TDI"; state.pullbackEpoch = currentCandleEpoch;
+          console.log("TDI MBL crossed upward first. Waiting for CCI cross.");
         }
       } else if (h1Dir === "SELL") {
         if (cciCrossSell) {
           state.pendingPullback = "SELL"; state.pullbackTrigger = "CCI"; state.pullbackEpoch = currentCandleEpoch;
+          console.log("CCI crossed 90 downward first. Waiting for TDI MBL cross.");
         } else if (tdiCrossDown) {
           state.pendingPullback = "SELL"; state.pullbackTrigger = "TDI"; state.pullbackEpoch = currentCandleEpoch;
+          console.log("TDI MBL crossed downward first. Waiting for CCI cross.");
         }
       }
     }
@@ -983,7 +1014,9 @@ async function runScanMode() {
     }
   } else {
     if (!h1Dir && !h1m15Aligned && !state.pendingPullback) {
-      state.waitingFor = null; state.setupEpoch = null; state.activeEntryType = null;
+      state.waitingFor = null;
+      state.setupEpoch = null;
+      state.activeEntryType = null;
     }
   }
 
