@@ -1,9 +1,9 @@
 {
   "waitingFor": null,
   "setupEpoch": null,
-  "lastProcessedEpoch": 1786701300,
+  "lastProcessedEpoch": 1786701600,
   "lastTgUpdateId": 16871120,
-  "h1TrendEpoch": 1786694400,
+  "h1TrendEpoch": 1786698000,
   "phaseATriggeredEpoch": 1786690800,
   "phaseCTriggeredEpoch": 1786633200,
   "phaseDTriggeredEpoch": null,
