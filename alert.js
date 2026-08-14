@@ -795,7 +795,7 @@ async function runScanMode() {
 
   if (!candles || candles.length < 60) { console.log("Not enough M5 candles."); return; }
 
-  const i = candles.length - 1; // Real-time M5 evaluation
+  const i = candles.length - 2; // <--- RESTORED TO CLOSED M5 CANDLE TO PREVENT REPAINTING (-2)
   const currentCandleEpoch = candles[i].epoch;
   const closes = candles.map(c => parseFloat(c.close));
 
@@ -818,7 +818,7 @@ async function runScanMode() {
   // Evaluate H1 Trend Direction & Fresh Cross (REAL-TIME H1 candle: length - 1)
   let h1Dir = null, h1Epoch = null, h1FreshCross = false;
   if (h1Candles && h1Candles.length >= 52) {
-    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 1;
+    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 1; // <--- REAL-TIME (-1)
     const smaFast1h = sma(h1Closes, 2), smaSlow1h = sma(h1Closes, 50);
     if (smaFast1h[h1ci] != null && smaSlow1h[h1ci] != null && smaFast1h[h1ci-1] != null && smaSlow1h[h1ci-1] != null) {
       if (smaFast1h[h1ci] > smaSlow1h[h1ci]) h1Dir = "BUY";
@@ -827,7 +827,7 @@ async function runScanMode() {
       const crossedDown = (smaFast1h[h1ci-1] >= smaSlow1h[h1ci-1]) && (smaFast1h[h1ci] < smaSlow1h[h1ci]);
       if (crossedUp || crossedDown) h1FreshCross = true;
     }
-    h1Epoch = h1Candles[h1Candles.length - 1].epoch;
+    h1Epoch = h1Candles[h1Candles.length - 1].epoch; // <--- REAL-TIME (-1)
   }
 
   // Evaluate M15 Trend Direction (REAL-TIME M15 candle: length - 1)
@@ -835,7 +835,7 @@ async function runScanMode() {
   if (m15Candles && m15Candles.length >= 60) {
     const m15Closes = m15Candles.map(c => parseFloat(c.close));
     const m15Macd = calculateMACD(m15Closes, 3, 50, 1);
-    const m15si = m15Macd.signalLine.length - 1;
+    const m15si = m15Macd.signalLine.length - 1; // <--- REAL-TIME (-1)
     if (m15Macd.signalLine[m15si] != null) {
       if (m15Macd.signalLine[m15si] > 0) m15Dir = "BUY";
       else if (m15Macd.signalLine[m15si] < 0) m15Dir = "SELL";
@@ -1013,7 +1013,7 @@ async function runScanMode() {
       console.log(`Setup armed for ${h1Dir} via ${entryType}`);
     }
   } else {
-    if (!h1Dir && !h1m15Aligned && !state.pendingPullback) {
+    if (!h1Dir && !m15m5Aligned && !state.pendingPullback) {
       state.waitingFor = null;
       state.setupEpoch = null;
       state.activeEntryType = null;
@@ -1073,7 +1073,7 @@ async function runScanMode() {
       const contractId = await executeTrade(direction);
       if (!contractId) {
         console.error("⚠️ Trade execution returned no contract ID. Skipping trade record.");
-        await sendTelegram(`❌ *${REPO_LABEL}*\n\nSignal triggered for ${direction}, but live broker execution failed. Trade aborted.`);
+        await sendTelegram(`❌ *${REPO_LABEL}*s\n\nSignal triggered for ${direction}, but live broker execution failed. Trade aborted.`);
         return;
       }
       await sendTelegram(message);
