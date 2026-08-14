@@ -878,7 +878,7 @@ async function runScanMode() {
 
   if (!candles || candles.length < 60) { console.log("Not enough M5 candles."); return; }
 
-  const i = candles.length - 2; // <--- CLOSED M5 CANDLE TO PREVENT REPAINTING (-2)
+  const i = candles.length - 2; // Closed M5 candle to prevent repainting (-2)
   const currentCandleEpoch = candles[i].epoch;
   const closes = candles.map(c => parseFloat(c.close));
 
@@ -898,10 +898,10 @@ async function runScanMode() {
     if (rsi[i] >= tdi.upper[i]) state.rsiUpperBreakSeen = true;
   }
 
-  // Evaluate H1 Trend Direction & Fresh Cross (REAL-TIME H1 candle: length - 1)
+  // Evaluate H1 Trend Direction & Fresh Cross (Real-time H1 candle: length - 1)
   let h1Dir = null, h1Epoch = null, h1FreshCross = false;
   if (h1Candles && h1Candles.length >= 52) {
-    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 1; // <--- REAL-TIME (-1)
+    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 1;
     const smaFast1h = sma(h1Closes, 2), smaSlow1h = sma(h1Closes, 50);
     if (smaFast1h[h1ci] != null && smaSlow1h[h1ci] != null && smaFast1h[h1ci-1] != null && smaSlow1h[h1ci-1] != null) {
       if (smaFast1h[h1ci] > smaSlow1h[h1ci]) h1Dir = "BUY";
@@ -910,23 +910,42 @@ async function runScanMode() {
       const crossedDown = (smaFast1h[h1ci-1] >= smaSlow1h[h1ci-1]) && (smaFast1h[h1ci] < smaSlow1h[h1ci]);
       if (crossedUp || crossedDown) h1FreshCross = true;
     }
-    h1Epoch = h1Candles[h1Candles.length - 1].epoch; // <--- REAL-TIME (-1)
+    h1Epoch = h1Candles[h1Candles.length - 1].epoch;
   }
 
-  // Evaluate M15 Trend Direction (REAL-TIME M15 candle: length - 1)
+  // Evaluate M15 Trend Direction (Real-time M15 candle: length - 1)
   let m15Dir = null;
   if (m15Candles && m15Candles.length >= 60) {
     const m15Closes = m15Candles.map(c => parseFloat(c.close));
     const m15Macd = calculateMACD(m15Closes, 3, 50, 1);
-    const m15si = m15Macd.signalLine.length - 1; // <--- REAL-TIME (-1)
+    const m15si = m15Macd.signalLine.length - 1;
     if (m15Macd.signalLine[m15si] != null) {
       if (m15Macd.signalLine[m15si] > 0) m15Dir = "BUY";
       else if (m15Macd.signalLine[m15si] < 0) m15Dir = "SELL";
     }
   }
 
-  // ── HARD HIGHER-TIMEFRAME TREND GATE ─────────────────────────────────
-  const h1m15Aligned = h1Dir && m15Dir && (h1Dir === m15Dir);
+  // ── HARD HIGHER-TIMEFRAME TREND GATE & M15 TDI FILTER ─────────────────
+  let m15TdiFilterPassed = true;
+  if (m15Candles && m15Candles.length >= 60) {
+    const m15Closes = m15Candles.map(c => parseFloat(c.close));
+    const m15Rsi = calculateRSI(m15Closes, 14);
+    const m15Tdi = calculateBollingerBands(m15Rsi, 34, 1.619);
+    const m15i = m15Candles.length - 1; // Real-time M15 evaluation
+    
+    if (m15Rsi[m15i] != null && m15Tdi.middle[m15i] != null) {
+      if (h1Dir === "BUY" && m15Dir === "BUY" && m15Rsi[m15i] < m15Tdi.middle[m15i]) {
+        m15TdiFilterPassed = false;
+        dbg("M15 TDI filter blocked BUY: M15 RSI is below MBL despite H1/M15 buy alignment.");
+      }
+      if (h1Dir === "SELL" && m15Dir === "SELL" && m15Rsi[m15i] > m15Tdi.middle[m15i]) {
+        m15TdiFilterPassed = false;
+        dbg("M15 TDI filter blocked SELL: M15 RSI is above MBL despite H1/M15 sell alignment.");
+      }
+    }
+  }
+
+  const h1m15Aligned = h1Dir && m15Dir && (h1Dir === m15Dir) && m15TdiFilterPassed;
   let justRealigned = false;
   if (state.h1m15WasAligned === undefined || state.h1m15WasAligned === null) {
     state.h1m15WasAligned = h1m15Aligned;
@@ -936,7 +955,7 @@ async function runScanMode() {
   }
 
   if (!h1m15Aligned) {
-    dbg("H1 and M15 trend alignment missing or conflicting. Resetting all setups.");
+    dbg("H1 and M15 trend alignment or M15 TDI filter missing. Resetting all setups.");
     state.waitingFor = null;
     state.setupEpoch = null;
     state.activeEntryType = null;
