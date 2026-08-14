@@ -761,23 +761,81 @@ async function runScanMode() {
       }
     }
 
-    // 5. Momentum Trailing Exit: M5 CCI crosses zero line against position
+    // 5. Stateful Momentum Trailing Exit: Arms when CCI or TDI MBL crosses against position, waits for confirmation, cancels on trend resumption.
     const m5CandlesExit = tradeData.candles;
-    if (m5CandlesExit && m5CandlesExit.length >= 36) {
+    if (m5CandlesExit && m5CandlesExit.length >= 38) {
+      const closesExit = m5CandlesExit.map(c => parseFloat(c.close));
       const cciExit = calculateCCI(m5CandlesExit, 34);
+      const rsiExit = calculateRSI(closesExit, 14);
+      const tdiExit = calculateBollingerBands(rsiExit, 34, 1.619);
       const ie = cciExit.length - 2;
-      if (cciExit[ie] != null && cciExit[ie-1] != null) {
+
+      if (ie >= 1 && cciExit[ie] != null && cciExit[ie-1] != null && rsiExit[ie] != null && rsiExit[ie-1] != null && tdiExit.middle[ie] != null && tdiExit.middle[ie-1] != null) {
+        if (openTrade.exitTrigger === undefined) {
+          openTrade.exitTrigger = null;
+        }
+
         const cciCrossZeroDown = cciExit[ie-1] >= 0 && cciExit[ie] < 0;
         const cciCrossZeroUp = cciExit[ie-1] <= 0 && cciExit[ie] > 0;
-        if (openTrade.direction === "BUY" && cciCrossZeroDown) {
-          const result = pnl >= 0 ? "WIN" : "LOSS";
-          await closeWith(result, `CCI Zero-line Exit — M5 CCI crossed below zero`);
-          return;
-        }
-        if (openTrade.direction === "SELL" && cciCrossZeroUp) {
-          const result = pnl >= 0 ? "WIN" : "LOSS";
-          await closeWith(result, `CCI Zero-line Exit — M5 CCI crossed above zero`);
-          return;
+        const mblPrev = tdiExit.middle[ie-1], mblCurr = tdiExit.middle[ie];
+        const rsiPrev = rsiExit[ie-1], rsiCurr = rsiExit[ie];
+        const tdiCrossDown = (rsiPrev >= mblPrev) && (rsiCurr < mblCurr);
+        const tdiCrossUp = (rsiPrev <= mblPrev) && (rsiCurr > mblCurr);
+
+        if (openTrade.direction === "BUY") {
+          const trendResumptionUp = (cciExit[ie-1] <= 0 && cciExit[ie] > 0) || ((rsiPrev <= mblPrev) && (rsiCurr > mblCurr));
+          if (openTrade.exitTrigger !== null && trendResumptionUp) {
+            console.log("Pending exit for BUY trade invalidated by trend resumption upward.");
+            openTrade.exitTrigger = null;
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+          }
+
+          if (openTrade.exitTrigger === "CCI" && tdiCrossDown) {
+            const result = pnl >= 0 ? "WIN" : "LOSS";
+            await closeWith(result, `Stateful Momentum Exit — CCI zero cross armed, validated by TDI MBL cross down`);
+            return;
+          } else if (openTrade.exitTrigger === "TDI" && cciCrossZeroDown) {
+            const result = pnl >= 0 ? "WIN" : "LOSS";
+            await closeWith(result, `Stateful Momentum Exit — TDI MBL cross armed, validated by CCI zero cross down`);
+            return;
+          } else if (openTrade.exitTrigger === null) {
+            if (cciCrossZeroDown) {
+              openTrade.exitTrigger = "CCI";
+              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+              console.log("CCI crossed zero downward. Armed pending exit, waiting for TDI MBL cross.");
+            } else if (tdiCrossDown) {
+              openTrade.exitTrigger = "TDI";
+              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+              console.log("TDI MBL crossed downward. Armed pending exit, waiting for CCI zero cross.");
+            }
+          }
+        } else if (openTrade.direction === "SELL") {
+          const trendResumptionDown = (cciExit[ie-1] >= 0 && cciExit[ie] < 0) || ((rsiPrev >= mblPrev) && (rsiCurr < mblCurr));
+          if (openTrade.exitTrigger !== null && trendResumptionDown) {
+            console.log("Pending exit for SELL trade invalidated by trend resumption downward.");
+            openTrade.exitTrigger = null;
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+          }
+
+          if (openTrade.exitTrigger === "CCI" && tdiCrossUp) {
+            const result = pnl >= 0 ? "WIN" : "LOSS";
+            await closeWith(result, `Stateful Momentum Exit — CCI zero cross armed, validated by TDI MBL cross up`);
+            return;
+          } else if (openTrade.exitTrigger === "TDI" && cciCrossZeroUp) {
+            const result = pnl >= 0 ? "WIN" : "LOSS";
+            await closeWith(result, `Stateful Momentum Exit — TDI MBL cross armed, validated by CCI zero cross up`);
+            return;
+          } else if (openTrade.exitTrigger === null) {
+            if (cciCrossZeroUp) {
+              openTrade.exitTrigger = "CCI";
+              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+              console.log("CCI crossed zero upward. Armed pending exit, waiting for TDI MBL cross.");
+            } else if (tdiCrossUp) {
+              openTrade.exitTrigger = "TDI";
+              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+              console.log("TDI MBL crossed upward. Armed pending exit, waiting for CCI zero cross.");
+            }
+          }
         }
       }
     }
@@ -795,7 +853,7 @@ async function runScanMode() {
 
   if (!candles || candles.length < 60) { console.log("Not enough M5 candles."); return; }
 
-  const i = candles.length - 2; // <--- RESTORED TO CLOSED M5 CANDLE TO PREVENT REPAINTING (-2)
+  const i = candles.length - 2; // <--- CLOSED M5 CANDLE TO PREVENT REPAINTING (-2)
   const currentCandleEpoch = candles[i].epoch;
   const closes = candles.map(c => parseFloat(c.close));
 
