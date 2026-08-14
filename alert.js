@@ -298,44 +298,56 @@ async function getDerivOTP(accountId) {
   return json.data.url;
 }
 
+// ── Resilient Trade Execution with withRetry ──
 async function executeTrade(direction) {
   if (!DERIV_TOKEN) { console.log("⚠️ DERIV_API_TOKEN not set. Skipping."); return null; }
   if (!DERIV_APP_ID) { console.log("⚠️ DERIV_APP_ID not set. Skipping."); return null; }
   if (!PROXY_URL || !PROXY_SECRET) { console.log("⚠️ PROXY_URL or PROXY_SECRET not set. Skipping."); return null; }
-  console.log(`🔄 Sending ${direction} trade via Cloudflare proxy...`);
-  const accountId = await getDerivAccountId();
-  const wsUrl = await getDerivOTP(accountId);
-  const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
-  const tpValue = typeof SAFETY_TP_USD !== 'undefined' ? SAFETY_TP_USD : 15.00;
-  const params = {
-    buy: "1",
-    price: STAKE_USD,
-    parameters: {
-      contract_type: direction === "BUY" ? "MULTUP" : "MULTDOWN",
-      underlying_symbol: TRADING_SYMBOL,
-      currency: "USD",
-      amount: STAKE_USD,
-      basis: "stake",
-      multiplier: MULTIPLIER,
-      limit_order: {
-        stop_loss: slDollars,
-        take_profit: tpValue
+  
+  return withRetry(async () => {
+    console.log(`🔄 Sending ${direction} trade via Cloudflare proxy...`);
+    const accountId = await getDerivAccountId();
+    const wsUrl = await getDerivOTP(accountId);
+    const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
+    const tpValue = typeof SAFETY_TP_USD !== 'undefined' ? SAFETY_TP_USD : 15.00;
+    const params = {
+      buy: "1",
+      price: STAKE_USD,
+      parameters: {
+        contract_type: direction === "BUY" ? "MULTUP" : "MULTDOWN",
+        underlying_symbol: TRADING_SYMBOL,
+        currency: "USD",
+        amount: STAKE_USD,
+        basis: "stake",
+        multiplier: MULTIPLIER,
+        limit_order: {
+          stop_loss: slDollars,
+          take_profit: tpValue
+        }
       }
+    };
+    const response = await fetch(PROXY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
+      body: JSON.stringify({ wsUrl, action: "buy", params })
+    });
+    const data = await response.json();
+    console.log("📨 Proxy response:", JSON.stringify(data));
+    
+    if (data.error || data.errors || String(JSON.stringify(data)).includes("429") || String(JSON.stringify(data)).includes("RateLimit")) {
+      throw new Error(`429/RateLimit/Error: ${JSON.stringify(data.error || data.errors || data)}`);
     }
-  };
-  const response = await fetch(PROXY_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
-    body: JSON.stringify({ wsUrl, action: "buy", params })
-  });
-  const data = await response.json();
-  console.log("📨 Proxy response:", JSON.stringify(data));
-  if (data.error) throw new Error(data.error);
-  const contractId = data.buy?.contract_id;
-  if (contractId) { console.log(`✅ Trade Executed! Contract ID: ${contractId}`); return contractId; }
-  return null;
+    
+    const contractId = data.buy?.contract_id;
+    if (contractId) { 
+      console.log(`✅ Trade Executed! Contract ID: ${contractId}`); 
+      return contractId; 
+    }
+    throw new Error("No contract ID returned in buy response");
+  }, 4, 5000);
 }
 
+// ── Resilient Contract Closing with withRetry ──
 async function closeContract(contractId) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -349,6 +361,7 @@ async function closeContract(contractId) {
     });
     const data = await response.json();
     console.log("📨 Close response:", JSON.stringify(data));
+    
     if (data.error || data.errors || String(JSON.stringify(data)).includes("429") || String(JSON.stringify(data)).includes("RateLimit")) {
       throw new Error(`429/RateLimit/Error: ${JSON.stringify(data.error || data.errors || data)}`);
     }
@@ -1027,7 +1040,7 @@ async function runScanMode() {
       const contractId = await executeTrade(direction);
       if (!contractId) {
         console.error("⚠️ Trade execution returned no contract ID. Skipping trade record.");
-        await sendTelegram(`❌ *${REPO_LABEL}*s\n\nSignal triggered for ${direction}, but live broker execution failed. Trade aborted.`);
+        await sendTelegram(`❌ *${REPO_LABEL}*\n\nSignal triggered for ${direction}, but live broker execution failed. Trade aborted.`);
         return;
       }
       await sendTelegram(message);
