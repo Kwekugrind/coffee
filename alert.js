@@ -30,12 +30,12 @@ const TRADING_SYMBOL = SYMBOL;
 const STAKE_USD = 10;
 const RISK_REWARD = 1.5;
 const SAFETY_TP_USD = 15.00; // $15 flat profit insurance ceiling on broker side
-const BREAKEVEN_ACTIVATE_USD = 3.00; // Move SL to entry once profit hits $3.00
+const BREAKEVEN_ACTIVATE_USD = 2.00; // Updated: Move SL to entry once profit hits $2.00
 const ATR_PERIOD = 14;
 const ATR_MULTIPLIER = 2.0; // Stop loss breathing room
 const SETUP_EXPIRY_BARS = 35;
-const MARKET_DATA_APP_ID = "1089"; // Dedicated public App ID for unauthenticated candle data
-const DERIV_APP_ID = process.env.DERIV_APP_ID || "67418"; // Personal App ID for trading/OTP
+const MARKET_DATA_APP_ID = "1089";
+const DERIV_APP_ID = process.env.DERIV_APP_ID || "67418";
 const TG_TOKEN = process.env.TG_BOT_TOKEN || process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const DERIV_TOKEN = process.env.DERIV_API_TOKEN;
@@ -713,7 +713,7 @@ async function runScanMode() {
       }
     }
 
-    // BREAKEVEN PROTECTION: Arm once profit hits $3.00
+    // BREAKEVEN PROTECTION: Arm once profit hits $2.00
     if (!openTrade.tp1Reached && !openTrade.breakevenSet && pnl >= BREAKEVEN_ACTIVATE_USD) {
       openTrade.breakevenSet = true;
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
@@ -752,26 +752,26 @@ async function runScanMode() {
       return;
     }
 
-    // 3. TP1 Price Level Hit (First BGA Whole Number) -> Arms 60% Peak-Drop Trailing
+    // 3. TP1 Price Level Hit (First BGA Whole Number) -> Arms 40% Peak-Drop Trailing
     if (!openTrade.tp1Reached) {
       const tp1Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1;
       if (tp1Hit) {
         openTrade.tp1Reached = true;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-        await sendTelegram(`🎯 TP1 BGA Whole Number reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — 60% peak-drop trailing now armed.`);
+        await sendTelegram(`🎯 TP1 BGA Whole Number reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — 40% peak-drop trailing now armed.`);
       }
     }
 
-    // 4. High-Water Mark Trailing (Activated at TP1 BGA Whole Number, exits if profit drops 60% from peak)
+    // 4. High-Water Mark Trailing (Activated at TP1 BGA Whole Number, exits if profit drops 40% from peak)
     if (openTrade.tp1Reached) {
       if (openTrade.peakProfit === null || pnl > openTrade.peakProfit) {
         openTrade.peakProfit = pnl;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       }
-      const dropThreshold = openTrade.peakProfit * 0.60;
+      const dropThreshold = openTrade.peakProfit * 0.40; // Updated: 40% drop from peak
       if (openTrade.peakProfit > 0 && pnl <= openTrade.peakProfit - dropThreshold) {
         const result = pnl >= 0 ? "WIN" : "LOSS";
-        await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 60% drop from peak)`);
+        await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 40% drop from peak)`);
         return;
       }
     }
