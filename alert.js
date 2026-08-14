@@ -214,7 +214,7 @@ async function withRetry(fn, retries = 3, delay = 4000) {
   }
 }
 
-// CONSOLIDATED DATA FETCHER (Opens ONE single WebSocket connection instead of 5 separate ones)
+// CONSOLIDATED DATA FETCHER (Opens ONE single WebSocket connection instead of separate ones)
 async function fetchAllData() {
   return withRetry(async () => {
     return new Promise((resolve, reject) => {
@@ -245,7 +245,7 @@ async function fetchAllData() {
   });
 }
 
-// CONSOLIDATED OPEN TRADE FETCHER (Price + Exit Candles in ONE connection)
+// CONSOLIDATED OPEN TRADE FETCHER (Price + M5 Candles + M15 Candles in ONE connection)
 async function fetchOpenTradeData() {
   return withRetry(async () => {
     return new Promise((resolve, reject) => {
@@ -254,12 +254,14 @@ async function fetchOpenTradeData() {
       ws.on("open", () => {
         ws.send(JSON.stringify({ req_id: 1, ticks_history: SYMBOL, granularity: M5, count: 50, end: "latest", style: "candles" }));
         ws.send(JSON.stringify({ req_id: 2, ticks_history: SYMBOL, count: 1, end: "latest", style: "ticks" }));
+        ws.send(JSON.stringify({ req_id: 3, ticks_history: SYMBOL, granularity: M15, count: 60, end: "latest", style: "candles" }));
       });
       ws.on("message", d => {
         const msg = JSON.parse(d);
         if (msg.req_id === 1) results.candles = msg.candles;
         if (msg.req_id === 2) results.price = msg.history?.prices?.[msg.history.prices.length - 1];
-        if (results.candles && results.price !== undefined) {
+        if (msg.req_id === 3) results.m15 = msg.candles;
+        if (results.candles && results.price !== undefined && results.m15 !== undefined) {
           ws.close();
           resolve(results);
         }
@@ -657,6 +659,29 @@ async function runScanMode() {
       
       await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
     };
+
+    // M15 SMA Opposite Cross Exit: Close immediately if M15 Fast/Slow SMA crosses against position
+    const m15CandlesExit = tradeData.m15;
+    if (m15CandlesExit && m15CandlesExit.length >= 52) {
+      const m15Closes = m15CandlesExit.map(c => parseFloat(c.close));
+      const m15ci = m15CandlesExit.length - 2;
+      const smaFast15m = sma(m15Closes, 2);
+      const smaSlow15m = sma(m15Closes, 50);
+
+      if (smaFast15m[m15ci] != null && smaSlow15m[m15ci] != null && smaFast15m[m15ci-1] != null && smaSlow15m[m15ci-1] != null) {
+        const m15CrossedUp = (smaFast15m[m15ci-1] <= smaSlow15m[m15ci-1]) && (smaFast15m[m15ci] > smaSlow15m[m15ci]);
+        const m15CrossedDown = (smaFast15m[m15ci-1] >= smaSlow15m[m15ci-1]) && (smaFast15m[m15ci] < smaSlow15m[m15ci]);
+
+        if (openTrade.direction === "BUY" && m15CrossedDown) {
+          await closeWith("LOSS", `M15 SMA Trend Reversal Exit — M15 Fast SMA crossed below Slow SMA`);
+          return;
+        }
+        if (openTrade.direction === "SELL" && m15CrossedUp) {
+          await closeWith("LOSS", `M15 SMA Trend Reversal Exit — M15 Fast SMA crossed above Slow SMA`);
+          return;
+        }
+      }
+    }
 
     // EARLY FAKEOUT DEFENSE: If price immediately fails before breakeven/TP1
     if (!openTrade.tp1Reached && !openTrade.breakevenSet) {
