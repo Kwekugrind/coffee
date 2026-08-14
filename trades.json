@@ -75,5 +75,24 @@
     "openTime": "2026-08-14 11:05:00",
     "closeTime": "2026-08-14 11:20:27",
     "result": "LOSS"
+  },
+  {
+    "id": "1HZ75V-2026-08-14T16:15:00.000Z",
+    "contractId": 9213958979,
+    "repo": "Coffee (V75-1s Demo)",
+    "symbol": "1HZ75V",
+    "direction": "BUY",
+    "entry": 8219.45,
+    "sl": 8164.792857142858,
+    "tp1": 8300,
+    "tp2": 8350,
+    "tp3": 8400,
+    "h1OpenAtEntry": null,
+    "tp1Reached": false,
+    "peakProfit": null,
+    "rr": 1.5,
+    "openTime": "2026-08-14 16:15:00",
+    "closeTime": null,
+    "result": null
   }
 ]
