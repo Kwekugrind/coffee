@@ -28,7 +28,7 @@ const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const R
 const TRADING_SYMBOL = SYMBOL;
 const STAKE_USD = 10;
 const RISK_REWARD = 1.5;
-const SAFETY_TP_USD = 15.00; // $15 flat profit insurance ceiling on broker side
+const SAFETY_TP_USD = 10.00; // $10 flat profit insurance ceiling on broker side
 const BREAKEVEN_ACTIVATE_USD = 2.00; // Move SL to entry once profit hits $2.00
 const ATR_PERIOD = 14;
 const ATR_MULTIPLIER = 2.0; // Stop loss breathing room
@@ -149,8 +149,12 @@ async function executeManualClose(result, reason) {
           serverPnl = closeRes.sell.profit;
         }
       } catch (e) {
-        console.error("Close error:", e.message);
-        continue;
+        if (e.message.includes("ContractNotFound") || e.message.includes("not found among your open positions")) {
+          serverPnl = -5.00; // Proceed with local close
+        } else {
+          console.error("Close error:", e.message);
+          continue;
+        }
       }
     }
     trade.result = result;
@@ -364,8 +368,11 @@ async function closeContract(contractId) {
     const data = await response.json();
     console.log("📨 Close response:", JSON.stringify(data));
     
-    if (data.error || data.errors || String(JSON.stringify(data)).includes("429") || String(JSON.stringify(data)).includes("RateLimit")) {
-      throw new Error(`429/RateLimit/Error: ${JSON.stringify(data.error || data.errors || data)}`);
+    const errCode = data.error?.code || data.errors?.code;
+    const errStr = String(JSON.stringify(data));
+    
+    if (errCode !== "ContractNotFound" && (data.error || data.errors || errStr.includes("429") || errStr.includes("RateLimit"))) {
+      throw new Error(`429/RateLimit/Error: ${errStr}`);
     }
     return data;
   }, 4, 5000);
@@ -565,8 +572,7 @@ function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
     }
     const tp1 = validTp1 || (baseWhole - step);
 
-    let referenceLevels = allLevels.filter(l => l < tp1).sort((a, b) => b - a);
-    let futureLevels = referenceLevels;
+    let futureLevels = allLevels.filter(l => l < tp1).sort((a, b) => b - a);
     if (fibMaxLimit) futureLevels = futureLevels.filter(l => l >= fibMaxLimit);
 
     let tp2 = futureLevels[0] || tp1 - halfStep;
@@ -643,9 +649,13 @@ async function runScanMode() {
             serverPnl = closeRes.sell.profit;
           }
         } catch (e) {
-          console.error("Close exception:", e.message);
-          await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Error\n\nException closing contract \`${openTrade.contractId}\`: ${e.message}. Retrying next scan.`);
-          return;
+          if (e.message.includes("ContractNotFound") || e.message.includes("not found among your open positions")) {
+            serverPnl = -5.00; // Proceed with local close
+          } else {
+            console.error("Close exception:", e.message);
+            await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Error\n\nException closing contract \`${openTrade.contractId}\`: ${e.message}. Retrying next scan.`);
+            return;
+          }
         }
       }
 
@@ -763,26 +773,26 @@ async function runScanMode() {
       return;
     }
 
-    // 3. TP1 Price Level Hit (First BGA Whole Number) -> Arms 40% Peak-Drop Trailing
+    // 3. TP1 Price Level Hit (First BGA Whole Number) -> Arms 20% Peak-Drop Trailing
     if (!openTrade.tp1Reached) {
       const tp1Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1;
       if (tp1Hit) {
         openTrade.tp1Reached = true;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-        await sendTelegram(`🎯 TP1 BGA Whole Number reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — 40% peak-drop trailing now armed.`);
+        await sendTelegram(`🎯 TP1 BGA Whole Number reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — 20% peak-drop trailing now armed.`);
       }
     }
 
-    // 4. High-Water Mark Trailing (Activated at TP1 BGA Whole Number, exits if profit drops 40% from peak)
+    // 4. High-Water Mark Trailing (Activated at TP1 BGA Whole Number, exits if profit drops 20% from peak)
     if (openTrade.tp1Reached) {
       if (openTrade.peakProfit === null || pnl > openTrade.peakProfit) {
         openTrade.peakProfit = pnl;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       }
-      const dropThreshold = openTrade.peakProfit * 0.40;
+      const dropThreshold = openTrade.peakProfit * 0.20; // Updated: 20% drop from peak
       if (openTrade.peakProfit > 0 && pnl <= openTrade.peakProfit - dropThreshold) {
         const result = pnl >= 0 ? "WIN" : "LOSS";
-        await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 40% drop from peak)`);
+        await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 20% drop from peak)`);
         return;
       }
     }
@@ -1251,7 +1261,7 @@ async function runScanMode() {
 
   if (MODE === "daily") { await runSummary("Daily"); return; }
   if (MODE === "weekly") { await runSummary("Weekly"); return; }
-  if (MODE === "nestedclose") { /* unused */ }
+  if (MODE === "monthly") { await runSummary("Monthly"); return; }
   if (MODE === "close_win") { await executeManualClose("WIN", "manual command"); return; }
   if (MODE === "close_loss") { await executeManualClose("LOSS", "manual command"); return; }
   if (MODE === "test") {
