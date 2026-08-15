@@ -26,7 +26,7 @@ const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const R
 // const SYMBOL = "1HZ100V"; const SYMBOL_NAME = "Volatility 100 (1s) Index"; const REPO_LABEL = "Ice Cream Machine"; const MULTIPLIER = 40; const COMMISSION_USD = 0.15;
 
 const TRADING_SYMBOL = SYMBOL;
-const STAKE_USD = 10;
+const STAKE_USD = 5;
 const RISK_REWARD = 1.5;
 const SAFETY_TP_USD = 10.00; // $10 flat profit insurance ceiling on broker side
 const BREAKEVEN_ACTIVATE_USD = 2.00; // Move SL to entry once profit hits $2.00
