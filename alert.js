@@ -565,7 +565,8 @@ function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
     }
     const tp1 = validTp1 || (baseWhole - step);
 
-    let futureLevels = allLevels.filter(l => l < tp1).sort((a, b) => b - a);
+    let referenceLevels = allLevels.filter(l => l < tp1).sort((a, b) => b - a);
+    let futureLevels = referenceLevels;
     if (fibMaxLimit) futureLevels = futureLevels.filter(l => l >= fibMaxLimit);
 
     let tp2 = futureLevels[0] || tp1 - halfStep;
@@ -786,19 +787,22 @@ async function runScanMode() {
       }
     }
 
-    // 5. Stateful Momentum Trailing Exit: Arms when CCI or TDI MBL crosses against position, waits for confirmation, cancels on trend resumption.
+    // 5. Stateful Triple-Indicator Momentum Trailing Exit: Requires CCI, TDI MBL, and M5 SMA crosses against position (can happen on different candles), with trend-resumption cancellation.
     const m5CandlesExit = tradeData.candles;
-    if (m5CandlesExit && m5CandlesExit.length >= 38) {
+    if (m5CandlesExit && m5CandlesExit.length >= 52) {
       const closesExit = m5CandlesExit.map(c => parseFloat(c.close));
       const cciExit = calculateCCI(m5CandlesExit, 34);
       const rsiExit = calculateRSI(closesExit, 14);
       const tdiExit = calculateBollingerBands(rsiExit, 34, 1.619);
+      const smaFast5m = sma(closesExit, 2);
+      const smaSlow5m = sma(closesExit, 50);
       const ie = cciExit.length - 2;
 
-      if (ie >= 1 && cciExit[ie] != null && cciExit[ie-1] != null && rsiExit[ie] != null && rsiExit[ie-1] != null && tdiExit.middle[ie] != null && tdiExit.middle[ie-1] != null) {
-        if (openTrade.exitTrigger === undefined) {
-          openTrade.exitTrigger = null;
-        }
+      if (ie >= 1 && cciExit[ie] != null && cciExit[ie-1] != null && rsiExit[ie] != null && rsiExit[ie-1] != null && tdiExit.middle[ie] != null && tdiExit.middle[ie-1] != null && smaFast5m[ie] != null && smaSlow5m[ie] != null && smaFast5m[ie-1] != null && smaSlow5m[ie-1] != null) {
+        
+        if (openTrade.exitCciSeen === undefined) openTrade.exitCciSeen = false;
+        if (openTrade.exitTdiSeen === undefined) openTrade.exitTdiSeen = false;
+        if (openTrade.exitSmaSeen === undefined) openTrade.exitSmaSeen = false;
 
         const cciCrossZeroDown = cciExit[ie-1] >= 0 && cciExit[ie] < 0;
         const cciCrossZeroUp = cciExit[ie-1] <= 0 && cciExit[ie] > 0;
@@ -806,60 +810,73 @@ async function runScanMode() {
         const rsiPrev = rsiExit[ie-1], rsiCurr = rsiExit[ie];
         const tdiCrossDown = (rsiPrev >= mblPrev) && (rsiCurr < mblCurr);
         const tdiCrossUp = (rsiPrev <= mblPrev) && (rsiCurr > mblCurr);
+        const smaCrossDown = (smaFast5m[ie-1] >= smaSlow5m[ie-1]) && (smaFast5m[ie] < smaSlow5m[ie]);
+        const smaCrossUp = (smaFast5m[ie-1] <= smaSlow5m[ie-1]) && (smaFast5m[ie] > smaSlow5m[ie]);
 
         if (openTrade.direction === "BUY") {
-          const trendResumptionUp = (cciExit[ie-1] <= 0 && cciExit[ie] > 0) || ((rsiPrev <= mblPrev) && (rsiCurr > mblCurr));
-          if (openTrade.exitTrigger !== null && trendResumptionUp) {
-            console.log("Pending exit for BUY trade invalidated by trend resumption upward.");
-            openTrade.exitTrigger = null;
+          // Invalidation / Cancellation (Trend resumption upward)
+          const trendResumptionUp = (cciExit[ie-1] <= 0 && cciExit[ie] > 0) || ((rsiPrev <= mblPrev) && (rsiCurr > mblCurr)) || (smaFast5m[ie-1] <= smaSlow5m[ie-1] && smaFast5m[ie] > smaSlow5m[ie]);
+          if ((openTrade.exitCciSeen || openTrade.exitTdiSeen || openTrade.exitSmaSeen) && trendResumptionUp) {
+            console.log("Pending exit state for BUY trade invalidated by trend resumption upward.");
+            openTrade.exitCciSeen = false;
+            openTrade.exitTdiSeen = false;
+            openTrade.exitSmaSeen = false;
             fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
           }
 
-          if (openTrade.exitTrigger === "CCI" && tdiCrossDown) {
-            const result = pnl >= 0 ? "WIN" : "LOSS";
-            await closeWith(result, `Stateful Momentum Exit — CCI zero cross armed, validated by TDI MBL cross down`);
-            return;
-          } else if (openTrade.exitTrigger === "TDI" && cciCrossZeroDown) {
-            const result = pnl >= 0 ? "WIN" : "LOSS";
-            await closeWith(result, `Stateful Momentum Exit — TDI MBL cross armed, validated by CCI zero cross down`);
-            return;
-          } else if (openTrade.exitTrigger === null) {
-            if (cciCrossZeroDown) {
-              openTrade.exitTrigger = "CCI";
-              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-              console.log("CCI crossed zero downward. Armed pending exit, waiting for TDI MBL cross.");
-            } else if (tdiCrossDown) {
-              openTrade.exitTrigger = "TDI";
-              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-              console.log("TDI MBL crossed downward. Armed pending exit, waiting for CCI zero cross.");
-            }
+          if (cciCrossZeroDown && !openTrade.exitCciSeen) {
+            openTrade.exitCciSeen = true;
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+            console.log("BUY Exit Trigger 1/3: CCI zero cross down recorded.");
           }
+          if (tdiCrossDown && !openTrade.exitTdiSeen) {
+            openTrade.exitTdiSeen = true;
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+            console.log("BUY Exit Trigger 2/3: TDI MBL cross down recorded.");
+          }
+          if (smaCrossDown && !openTrade.exitSmaSeen) {
+            openTrade.exitSmaSeen = true;
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+            console.log("BUY Exit Trigger 3/3: M5 SMA cross down recorded.");
+          }
+
+          if (openTrade.exitCciSeen && openTrade.exitTdiSeen && openTrade.exitSmaSeen) {
+            const result = pnl >= 0 ? "WIN" : "LOSS";
+            await closeWith(result, `Stateful Triple Exit — CCI, TDI MBL, and M5 SMA crosses all confirmed against BUY position`);
+            return;
+          }
+
         } else if (openTrade.direction === "SELL") {
-          const trendResumptionDown = (cciExit[ie-1] >= 0 && cciExit[ie] < 0) || ((rsiPrev >= mblPrev) && (rsiCurr < mblCurr));
-          if (openTrade.exitTrigger !== null && trendResumptionDown) {
+          // Invalidation / Cancellation (Trend resumption downward)
+          const trendResumptionDown = (cciExit[ie-1] >= 0 && cciExit[ie] < 0) || ((rsiPrev >= mblPrev) && (rsiCurr < mblCurr)) || (smaFast5m[ie-1] >= smaSlow5m[ie-1] && smaFast5m[ie] < smaSlow5m[ie]);
+          if ((openTrade.exitCciSeen || openTrade.exitTdiSeen || openTrade.exitSmaSeen) && trendResumptionDown) {
             console.log("Pending exit for SELL trade invalidated by trend resumption downward.");
-            openTrade.exitTrigger = null;
+            openTrade.exitCciSeen = false;
+            openTrade.exitTdiSeen = false;
+            openTrade.exitSmaSeen = false;
             fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
           }
 
-          if (openTrade.exitTrigger === "CCI" && tdiCrossUp) {
+          if (cciCrossZeroUp && !openTrade.exitCciSeen) {
+            openTrade.exitCciSeen = true;
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+            console.log("SELL Exit Trigger 1/3: CCI zero cross up recorded.");
+          }
+          if (tdiCrossUp && !openTrade.exitTdiSeen) {
+            openTrade.exitTdiSeen = true;
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+            console.log("SELL Exit Trigger 2/3: TDI MBL cross up recorded.");
+          }
+          if (smaCrossUp && !openTrade.exitSmaSeen) {
+            openTrade.exitSmaSeen = true;
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+            console.log("SELL Exit Trigger 3/3: M5 SMA cross up recorded.");
+          }
+
+          if (openTrade.exitCciSeen && openTrade.exitTdiSeen && openTrade.exitSmaSeen) {
             const result = pnl >= 0 ? "WIN" : "LOSS";
-            await closeWith(result, `Stateful Momentum Exit — CCI zero cross armed, validated by TDI MBL cross up`);
+            await closeWith(result, `Stateful Triple Exit — CCI, TDI MBL, and M5 SMA crosses all confirmed against SELL position`);
             return;
-          } else if (openTrade.exitTrigger === "TDI" && cciCrossZeroUp) {
-            const result = pnl >= 0 ? "WIN" : "LOSS";
-            await closeWith(result, `Stateful Momentum Exit — TDI MBL cross armed, validated by CCI zero cross up`);
-            return;
-          } else if (openTrade.exitTrigger === null) {
-            if (cciCrossZeroUp) {
-              openTrade.exitTrigger = "CCI";
-              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-              console.log("CCI crossed zero upward. Armed pending exit, waiting for TDI MBL cross.");
-            } else if (tdiCrossUp) {
-              openTrade.exitTrigger = "TDI";
-              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-              console.log("TDI MBL crossed upward. Armed pending exit, waiting for CCI zero cross.");
-            }
           }
         }
       }
@@ -1190,7 +1207,7 @@ async function runScanMode() {
       trades.push({
         id: `${SYMBOL}-${isoTime}`, contractId, repo: REPO_LABEL, symbol: SYMBOL,
         direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry: null, tp1Reached: false,
-        peakProfit: null, rr: RISK_REWARD, openTime: timeFormatted, closeTime: null, result: null
+        peakProfit: null, rr: RISK_REWARD, entryType: state.activeEntryType, openTime: timeFormatted, closeTime: null, result: null
       });
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
     } catch (execErr) {
@@ -1234,7 +1251,7 @@ async function runScanMode() {
 
   if (MODE === "daily") { await runSummary("Daily"); return; }
   if (MODE === "weekly") { await runSummary("Weekly"); return; }
-  if (MODE === "monthly") { await runSummary("Monthly"); return; }
+  if (MODE === "nestedclose") { /* unused */ }
   if (MODE === "close_win") { await executeManualClose("WIN", "manual command"); return; }
   if (MODE === "close_loss") { await executeManualClose("LOSS", "manual command"); return; }
   if (MODE === "test") {
