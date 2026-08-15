@@ -1,7 +1,12 @@
 {
-  "name": "coffee-machine",
+  "name": "deriv-trading-bot",
   "version": "3.0.0",
+  "description": "Automated Deriv Multiplier Trading Bot with Multi-Timeframe Strategy",
+  "main": "alert.js",
   "type": "module",
+  "scripts": {
+    "start": "node alert.js"
+  },
   "dependencies": {
     "node-fetch": "^3.3.2",
     "ws": "^8.17.0"
