@@ -1,4 +1,4 @@
-name: V3.0 External Cron Trigger Bot
+name: Deriv Multiplier Trading Bot
 
 on:
   workflow_dispatch:
@@ -8,13 +8,15 @@ on:
         required: false
         default: "cronjob"
       mode:
-        description: "Bot mode (scan, weekly, monthly)"
+        description: "Bot mode (scan, weekly, monthly, test, close_win, close_loss)"
         required: false
         default: "scan"
+  schedule:
+    - cron: '*/5 * * * *'
 
 concurrency:
-  group: signal-bot-execution
-  cancel-in-progress: true
+  group: deriv-bot-execution
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -23,7 +25,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
