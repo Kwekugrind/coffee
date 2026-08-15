@@ -898,17 +898,25 @@ async function runScanMode() {
     if (rsi[i] >= tdi.upper[i]) state.rsiUpperBreakSeen = true;
   }
 
-  // Evaluate H1 Trend Direction & Fresh Cross (Real-time H1 candle: length - 1)
-  let h1Dir = null, h1Epoch = null, h1FreshCross = false;
+  // Evaluate H1 Trend Direction & Fresh Cross (DUAL-SPEED: Phase A uses length -2, Continuations use length -1)
+  let h1FreshCross = false;
   if (h1Candles && h1Candles.length >= 52) {
-    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 1;
+    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 2; // <--- CLOSED CANDLE FOR FRESH CROSS (-2)
     const smaFast1h = sma(h1Closes, 2), smaSlow1h = sma(h1Closes, 50);
     if (smaFast1h[h1ci] != null && smaSlow1h[h1ci] != null && smaFast1h[h1ci-1] != null && smaSlow1h[h1ci-1] != null) {
-      if (smaFast1h[h1ci] > smaSlow1h[h1ci]) h1Dir = "BUY";
-      else if (smaFast1h[h1ci] < smaSlow1h[h1ci]) h1Dir = "SELL";
       const crossedUp = (smaFast1h[h1ci-1] <= smaSlow1h[h1ci-1]) && (smaFast1h[h1ci] > smaSlow1h[h1ci]);
       const crossedDown = (smaFast1h[h1ci-1] >= smaSlow1h[h1ci-1]) && (smaFast1h[h1ci] < smaSlow1h[h1ci]);
       if (crossedUp || crossedDown) h1FreshCross = true;
+    }
+  }
+
+  let h1Dir = null, h1Epoch = null;
+  if (h1Candles && h1Candles.length >= 52) {
+    const h1Closes = h1Candles.map(c => parseFloat(c.close)), h1ci = h1Candles.length - 1; // <--- REAL-TIME FOR CONTINUATIONS (-1)
+    const smaFast1h = sma(h1Closes, 2), smaSlow1h = sma(h1Closes, 50);
+    if (smaFast1h[h1ci] != null && smaSlow1h[h1ci] != null) {
+      if (smaFast1h[h1ci] > smaSlow1h[h1ci]) h1Dir = "BUY";
+      else if (smaFast1h[h1ci] < smaSlow1h[h1ci]) h1Dir = "SELL";
     }
     h1Epoch = h1Candles[h1Candles.length - 1].epoch;
   }
@@ -931,7 +939,7 @@ async function runScanMode() {
     const m15Closes = m15Candles.map(c => parseFloat(c.close));
     const m15Rsi = calculateRSI(m15Closes, 14);
     const m15Tdi = calculateBollingerBands(m15Rsi, 34, 1.619);
-    const m15i = m15Candles.length - 1; // Real-time M15 evaluation
+    const m15i = m15Candles.length - 1;
     
     if (m15Rsi[m15i] != null && m15Tdi.middle[m15i] != null) {
       if (h1Dir === "BUY" && m15Dir === "BUY" && m15Rsi[m15i] < m15Tdi.middle[m15i]) {
@@ -974,7 +982,7 @@ async function runScanMode() {
   let m5Ready = false;
   let entryType = null;
 
-  // ── PHASE A: STRICTLY A LIVE FRESH H1 CROSS (First Trade) ────────────
+  // ── PHASE A: STRICTLY A CLOSED FRESH H1 CROSS (First Trade) ───────────
   if (h1FreshCross && state.phaseATriggeredEpoch !== h1Epoch) {
     const mblVal = tdi.middle[i];
     const m5Aligned = (mblVal != null && rsi[i] != null) && ((h1Dir === "BUY" && rsi[i] > mblVal) || (h1Dir === "SELL" && rsi[i] < mblVal));
