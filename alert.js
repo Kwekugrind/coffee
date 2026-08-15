@@ -163,7 +163,7 @@ async function executeManualClose(result, reason) {
     const icon = result === "WIN" ? "✅" : "❌";
     const contractType = trade.direction === "BUY" ? "MULTUP" : "MULTDOWN";
     const durationMs = new Date(trade.closeTime) - new Date(trade.openTime);
-    const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
+    const slDollars = parseFloat(STAKE_USD.toFixed(2));
     const tpDollars = parseFloat((STAKE_USD * RISK_REWARD).toFixed(2));
     const pnlStr = serverPnl >= 0 ? `+$${serverPnl.toFixed(2)}` : `-$${Math.abs(serverPnl).toFixed(2)}`;
     const tp1Status = trade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
@@ -314,7 +314,7 @@ async function executeTrade(direction) {
     console.log(`🔄 Sending ${direction} trade via Cloudflare proxy...`);
     const accountId = await getDerivAccountId();
     const wsUrl = await getDerivOTP(accountId);
-    const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
+    const slDollars = parseFloat(STAKE_USD.toFixed(2));
     const tpValue = typeof SAFETY_TP_USD !== 'undefined' ? SAFETY_TP_USD : 15.00;
     const params = {
       buy: "1",
@@ -663,7 +663,7 @@ async function runScanMode() {
       const icon = result === "WIN" ? "✅" : "❌";
       const contractType = openTrade.direction === "BUY" ? "MULTUP" : "MULTDOWN";
       const durationMs = new Date(openTrade.closeTime) - new Date(openTrade.openTime);
-      const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
+      const slDollars = parseFloat(STAKE_USD.toFixed(2));
       const tpDollars = parseFloat((STAKE_USD * RISK_REWARD).toFixed(2));
       const tp1Status = openTrade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
       const pnlStr = serverPnl >= 0 ? `+$${serverPnl.toFixed(2)}` : `-$${Math.abs(serverPnl).toFixed(2)}`;
@@ -1182,7 +1182,7 @@ async function runScanMode() {
   }
 
   if (signalTriggered) {
-    const slDollars = parseFloat((STAKE_USD * 0.5).toFixed(2));
+    const slDollars = parseFloat(STAKE_USD.toFixed(2));
     const bgaTps = await calculateBgaTakeProfits(entry, direction, atr14, d1Candles);
     tp1 = bgaTps.tp1;
     tp2 = bgaTps.tp2;
