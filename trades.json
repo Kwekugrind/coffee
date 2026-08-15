@@ -56,7 +56,7 @@
     "rr": 1.5,
     "entryType": "PHASE_C",
     "openTime": "2026-08-15 21:10:00",
-    "closeTime": null,
-    "result": null
+    "closeTime": "2026-08-15 21:45:30",
+    "result": "LOSS"
   }
 ]
