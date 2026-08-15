@@ -212,6 +212,6 @@
     "openTime": "2026-08-15 09:10:00",
     "closeTime": null,
     "result": null,
-    "exitTrigger": "TDI"
+    "exitTrigger": null
   }
 ]
