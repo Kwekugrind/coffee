@@ -165,8 +165,8 @@ async function executeManualClose(result, reason) {
     const durationMs = new Date(trade.closeTime) - new Date(trade.openTime);
     const slDollars = parseFloat(STAKE_USD.toFixed(2));
     const tpDollars = parseFloat((STAKE_USD * RISK_REWARD).toFixed(2));
-    const pnlStr = serverPnl >= 0 ? `+$${serverPnl.toFixed(2)}` : `-$${Math.abs(serverPnl).toFixed(2)}`;
     const tp1Status = trade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
+    const pnlStr = serverPnl >= 0 ? `+$${serverPnl.toFixed(2)}` : `-$${Math.abs(serverPnl).toFixed(2)}`;
     await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${trade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${trade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${trade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${trade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${reason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${trade.openTime}\nClosed: ${trade.closeTime}\n` + (trade.contractId ? `Contract: \`${trade.contractId}\`` : ""));
   }
 }
@@ -215,6 +215,27 @@ async function withRetry(fn, retries = 3, delay = 4000) {
       dbg(`Retry ${i+1}/${retries} after error: ${e.message}. Waiting ${currentDelay}ms...`);
       await new Promise(r => setTimeout(r, currentDelay));
     }
+  }
+}
+
+// BROKER-SIDE OPEN POSITION CHECKER
+async function hasOpenPositionOnBroker() {
+  if (!DERIV_TOKEN || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return false;
+  try {
+    const accountId = await getDerivAccountId();
+    const wsUrl = await getDerivOTP(accountId);
+    const response = await fetch(PROXY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
+      body: JSON.stringify({ wsUrl, action: "portfolio", params: {} })
+    });
+    const data = await response.json();
+    const contracts = data.portfolio?.contracts || [];
+    const activeContract = contracts.find(c => (c.underlying_symbol || c.symbol) === TRADING_SYMBOL);
+    return !!activeContract;
+  } catch (e) {
+    dbg("Broker open position check error:", e.message);
+    return false;
   }
 }
 
@@ -620,8 +641,16 @@ async function runScanMode() {
   let trades = [];
   try { trades = JSON.parse(fs.readFileSync("trades.json")); } catch {}
 
+  // ── 1. Broker-Side Duplicate Position Safeguard ──────────────────────
+  const brokerHasOpen = await hasOpenPositionOnBroker();
+  let openTrade = trades.find(t => !t.result);
+
+  if (brokerHasOpen && !openTrade) {
+    console.log("⚠️ DUPLICATE PREVENTION: Deriv broker reports an active open position for this symbol, but local trades.json is empty. Aborting scan.");
+    return;
+  }
+
   // ── Open Position Management ──────────────────────────────────────────
-  const openTrade = trades.find(t => !t.result);
   if (openTrade) {
     const tradeData = await fetchOpenTradeData();
     const currentPrice = tradeData.price;
@@ -1182,6 +1211,14 @@ async function runScanMode() {
   }
 
   if (signalTriggered) {
+    // Final double check against broker before placing buy order
+    const finalBrokerCheck = await hasOpenPositionOnBroker();
+    if (finalBrokerCheck) {
+      console.log("⚠️ DUPLICATE PREVENTION: Broker confirmed an active position right before order execution. Aborting order.");
+      await sendTelegram(`⚠️ *${REPO_LABEL}* — Signal triggered for ${direction}, but aborted because an active position already exists on Deriv.`);
+      return;
+    }
+
     const slDollars = parseFloat(STAKE_USD.toFixed(2));
     const bgaTps = await calculateBgaTakeProfits(entry, direction, atr14, d1Candles);
     tp1 = bgaTps.tp1;
