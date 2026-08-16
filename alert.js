@@ -32,7 +32,7 @@ const SAFETY_TP_USD = 10.00; // $10 flat profit insurance ceiling on broker side
 const BREAKEVEN_ACTIVATE_USD = 2.00; // Move SL to entry once profit hits $2.00
 const ATR_PERIOD = 14;
 const ATR_MULTIPLIER = 2.0; // Stop loss breathing room
-const SETUP_EXPIRY_BARS = 35;
+const SETUP_EXPIRY_BARS = 15; // Updated Phase B expiration bars
 const MARKET_DATA_APP_ID = "1089"; // Dedicated public App ID for unauthenticated candle data
 const DERIV_APP_ID = process.env.DERIV_APP_ID || "67418"; // Personal App ID for trading/OTP
 const TG_TOKEN = process.env.TG_BOT_TOKEN || process.env.TG_TOKEN;
@@ -171,7 +171,11 @@ async function executeManualClose(result, reason) {
   }
 }
 
-let state = { waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, phaseATriggeredEpoch: null, activeEntryType: null };
+let state = { 
+  waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, 
+  phaseATriggeredEpoch: null, activeEntryType: null,
+  pendingPullback: null, pullbackEpoch: null, phaseBStochSeen: false, phaseBCciSeen: false, phaseBTdiSeen: false 
+};
 try {
   const s = JSON.parse(fs.readFileSync("state.json"));
   state = {
@@ -180,7 +184,12 @@ try {
     setupEpoch: s.setupEpoch ?? null,
     h1TrendEpoch: s.h1TrendEpoch ?? null,
     phaseATriggeredEpoch: s.phaseATriggeredEpoch ?? null,
-    activeEntryType: s.activeEntryType ?? null
+    activeEntryType: s.activeEntryType ?? null,
+    pendingPullback: s.pendingPullback ?? null,
+    pullbackEpoch: s.pullbackEpoch ?? null,
+    phaseBStochSeen: s.phaseBStochSeen ?? false,
+    phaseBCciSeen: s.phaseBCciSeen ?? false,
+    phaseBTdiSeen: s.phaseBTdiSeen ?? false
   };
 } catch {}
 
@@ -429,6 +438,69 @@ function calculateStochastic(candles, kPeriod = 5, dPeriod = 3, slowing = 3) {
   return { k: kLine, d: dLine };
 }
 
+function calculateCCI(candles, period = 34) {
+  const tp = candles.map(c => (parseFloat(c.high) + parseFloat(c.low) + parseFloat(c.close)) / 3);
+  const smaTp = sma(tp, period);
+  return tp.map((_, i) => {
+    if (i < period - 1 || smaTp[i] == null) return null;
+    const sliceTp = tp.slice(i - period + 1, i + 1);
+    const meanTp = smaTp[i];
+    const meanDev = sliceTp.reduce((sum, val) => sum + Math.abs(val - meanTp), 0) / period;
+    if (meanDev === 0) return 0;
+    return (tp[i] - meanTp) / (0.015 * meanDev);
+  });
+}
+
+function calculateRSI(data, period = 14) {
+  const result = new Array(data.length).fill(null);
+  if (data.length <= period) return result;
+  let gainSum = 0, lossSum = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = data[i] - data[i-1];
+    if (diff >= 0) gainSum += diff;
+    else lossSum -= diff;
+  }
+  let avgGain = gainSum / period;
+  let avgLoss = lossSum / period;
+  let rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+  result[period] = 100 - (100 / (1 + rs));
+  for (let i = period + 1; i < data.length; i++) {
+    const diff = data[i] - data[i-1];
+    const gain = diff >= 0 ? diff : 0;
+    const loss = diff >= 0 ? 0 : -diff;
+    avgGain = ((avgGain * (period - 1)) + gain) / period;
+    avgLoss = ((avgLoss * (period - 1)) + loss) / period;
+    rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    result[i] = 100 - (100 / (1 + rs));
+  }
+  return result;
+}
+
+function calculateBollingerBands(data, period = 34, deviation = 1.619) {
+  const middle = sma(data, period);
+  const upper = [];
+  const lower = [];
+  for (let i = 0; i < data.length; i++) {
+    if (i < period - 1 || middle[i] == null || data[i] == null) {
+      upper.push(null);
+      lower.push(null);
+      continue;
+    }
+    const slice = data.slice(i - period + 1, i + 1);
+    if (slice.some(val => val == null)) {
+      upper.push(null);
+      lower.push(null);
+      continue;
+    }
+    const mean = middle[i];
+    const variance = slice.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / period;
+    const stdev = Math.sqrt(variance);
+    upper.push(mean + (stdev * deviation));
+    lower.push(mean - (stdev * deviation));
+  }
+  return { upper, middle, lower };
+}
+
 function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
   let step = 100;
   if (entry > 20000) step = 500;
@@ -666,8 +738,11 @@ async function runScanMode() {
     if (state.waitingFor !== h1TrendDir) {
       dbg(`H1 trend change detected: switching waitingFor to ${h1TrendDir}`);
       state.waitingFor = h1TrendDir;
-      state.setupEpoch = null;
-      state.activeEntryType = null;
+      state.pendingPullback = null;
+      state.pullbackEpoch = null;
+      state.phaseBStochSeen = false;
+      state.phaseBCciSeen = false;
+      state.phaseBTdiSeen = false;
     }
   } else {
     state.waitingFor = null;
@@ -679,31 +754,119 @@ async function runScanMode() {
     return;
   }
 
-  // 2. Calculate M5 Stochastic (5, 3, 3)
+  // 2. Indicator Calculations for Phase A & B (Closed M5 candle index: si)
+  const si = candles.length - 2;
   const stoch = calculateStochastic(candles, 5, 3, 3);
-  const si = candles.length - 2; // Closed M5 candle evaluation
+  const cci = calculateCCI(candles, 34);
+  const rsi = calculateRSI(closes, 14);
+  const tdi = calculateBollingerBands(rsi, 34, 1.619);
 
   let signalTriggered = false, direction = "", entry, sl, risk, tp1, tp2, tp3;
+  let entryType = null;
 
-  if (si >= 1 && stoch.k[si] != null && stoch.d[si] != null && stoch.k[si-1] != null && stoch.d[si-1] != null) {
-    const stochCrossBuy = (stoch.k[si-1] <= 20 || stoch.d[si-1] <= 20) && 
-                          (stoch.k[si] > 20 && stoch.d[si] > 20) && 
-                          (stoch.k[si-1] <= stoch.d[si-1]) && 
-                          (stoch.k[si] > stoch.d[si]);
+  if (si >= 1 && stoch.k[si] != null && stoch.d[si] != null && stoch.k[si-1] != null && stoch.d[si-1] != null &&
+      cci[si] != null && cci[si-1] != null && rsi[si] != null && rsi[si-1] != null && tdi.middle[si] != null && tdi.middle[si-1] != null) {
 
-    const stochCrossSell = (stoch.k[si-1] >= 80 || stoch.d[si-1] >= 80) && 
-                           (stoch.k[si] < 80 && stoch.d[si] < 80) && 
-                           (stoch.k[si-1] >= stoch.d[si-1]) && 
-                           (stoch.k[si] < stoch.d[si]);
+    // --- PHASE A: Stochastic Cross from below 20 (BUY) / above 80 (SELL) ---
+    const stochCrossBuyPhaseA = (stoch.k[si-1] <= 20 || stoch.d[si-1] <= 20) && 
+                                (stoch.k[si] > 20 && stoch.d[si] > 20) && 
+                                (stoch.k[si-1] <= stoch.d[si-1]) && 
+                                (stoch.k[si] > stoch.d[si]);
 
-    if (state.waitingFor === "BUY" && stochCrossBuy) {
+    const stochCrossSellPhaseA = (stoch.k[si-1] >= 80 || stoch.d[si-1] >= 80) && 
+                                 (stoch.k[si] < 80 && stoch.d[si] < 80) && 
+                                 (stoch.k[si-1] >= stoch.d[si-1]) && 
+                                 (stoch.k[si] < stoch.d[si]);
+
+    if (state.waitingFor === "BUY" && stochCrossBuyPhaseA) {
       signalTriggered = true;
       direction = "BUY";
       entry = closes[i];
-    } else if (state.waitingFor === "SELL" && stochCrossSell) {
+      entryType = 'PHASE_A';
+    } else if (state.waitingFor === "SELL" && stochCrossSellPhaseA) {
       signalTriggered = true;
       direction = "SELL";
       entry = closes[i];
+      entryType = 'PHASE_A';
+    }
+
+    // --- PHASE B: Stateful Pullback / Re-entry Engine ---
+    if (!signalTriggered) {
+      // Check Expiration (15 bars starting from first seen trigger)
+      if (state.pendingPullback && state.pullbackEpoch && (currentCandleEpoch - state.pullbackEpoch) > (SETUP_EXPIRY_BARS * M5)) {
+        dbg("Phase B setup expired (15 bars reached). Resetting.");
+        state.pendingPullback = null;
+        state.pullbackEpoch = null;
+        state.phaseBStochSeen = false;
+        state.phaseBCciSeen = false;
+        state.phaseBTdiSeen = false;
+      }
+
+      // Check Direction Shift Invalidation
+      if (state.pendingPullback && state.pendingPullback !== state.waitingFor) {
+        state.pendingPullback = null;
+        state.pullbackEpoch = null;
+        state.phaseBStochSeen = false;
+        state.phaseBCciSeen = false;
+        state.phaseBTdiSeen = false;
+      }
+
+      // Indicator crosses for Phase B
+      const stochCrossBuyB = (stoch.k[si-1] <= 50 || stoch.d[si-1] <= 50) && (stoch.k[si] > 50 && stoch.d[si] > 50) && (stoch.k[si-1] <= stoch.d[si-1]) && (stoch.k[si] > stoch.d[si]);
+      const stochCrossSellB = (stoch.k[si-1] >= 50 || stoch.d[si-1] >= 50) && (stoch.k[si] < 50 && stoch.d[si] < 50) && (stoch.k[si-1] >= stoch.d[si-1]) && (stoch.k[si] < stoch.d[si]);
+
+      const cciCrossBuyB = cci[si-1] <= 0 && cci[si] > 0;
+      const cciCrossSellB = cci[si-1] >= 0 && cci[si] < 0;
+
+      const tdiCrossBuyB = rsi[si-1] <= tdi.middle[si-1] && rsi[si] > tdi.middle[si];
+      const tdiCrossSellB = rsi[si-1] >= tdi.middle[si-1] && rsi[si] < tdi.middle[si];
+
+      if (state.waitingFor === "BUY") {
+        const gotStoch = stochCrossBuyB;
+        const gotCci = cciCrossBuyB;
+        const gotTdi = tdiCrossBuyB;
+
+        if (gotStoch || gotCci || gotTdi) {
+          if (!state.pendingPullback) {
+            state.pendingPullback = "BUY";
+            state.pullbackEpoch = currentCandleEpoch; // Start 15-bar timer on first trigger
+            dbg("Phase B BUY setup armed.");
+          }
+          if (gotStoch) state.phaseBStochSeen = true;
+          if (gotCci) state.phaseBCciSeen = true;
+          if (gotTdi) state.phaseBTdiSeen = true;
+        }
+
+        if (state.pendingPullback === "BUY" && state.phaseBStochSeen && state.phaseBCciSeen && state.phaseBTdiSeen) {
+          signalTriggered = true;
+          direction = "BUY";
+          entry = closes[i];
+          entryType = 'PHASE_B';
+        }
+
+      } else if (state.waitingFor === "SELL") {
+        const gotStoch = stochCrossSellB;
+        const gotCci = cciCrossSellB;
+        const gotTdi = tdiCrossSellB;
+
+        if (gotStoch || gotCci || gotTdi) {
+          if (!state.pendingPullback) {
+            state.pendingPullback = "SELL";
+            state.pullbackEpoch = currentCandleEpoch; // Start 15-bar timer on first trigger
+            dbg("Phase B SELL setup armed.");
+          }
+          if (gotStoch) state.phaseBStochSeen = true;
+          if (gotCci) state.phaseBCciSeen = true;
+          if (gotTdi) state.phaseBTdiSeen = true;
+        }
+
+        if (state.pendingPullback === "SELL" && state.phaseBStochSeen && state.phaseBCciSeen && state.phaseBTdiSeen) {
+          signalTriggered = true;
+          direction = "SELL";
+          entry = closes[i];
+          entryType = 'PHASE_B';
+        }
+      }
     }
   }
 
@@ -725,7 +888,7 @@ async function runScanMode() {
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: Phase A (H1 EMA 50 + M5 Stoch Cross)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Stateful Confluence)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
     try {
       const contractId = await executeTrade(direction);
@@ -738,7 +901,7 @@ async function runScanMode() {
       trades.push({
         id: `${SYMBOL}-${isoTime}`, contractId, repo: REPO_LABEL, symbol: SYMBOL,
         direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry: null, tp1Reached: false,
-        peakProfit: null, rr: RISK_REWARD, entryType: 'PHASE_A', openTime: timeFormatted, closeTime: null, result: null
+        peakProfit: null, rr: RISK_REWARD, entryType: entryType, openTime: timeFormatted, closeTime: null, result: null
       });
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
     } catch (execErr) {
@@ -748,6 +911,11 @@ async function runScanMode() {
     }
 
     state.waitingFor = null;
+    state.pendingPullback = null;
+    state.pullbackEpoch = null;
+    state.phaseBStochSeen = false;
+    state.phaseBCciSeen = false;
+    state.phaseBTdiSeen = false;
   }
 
   state.lastProcessedEpoch = currentCandleEpoch;
