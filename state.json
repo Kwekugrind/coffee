@@ -1,21 +1,9 @@
 {
-  "waitingFor": "SELL",
+  "waitingFor": null,
   "setupEpoch": null,
-  "lastProcessedEpoch": 1786908000,
+  "lastProcessedEpoch": null,
   "lastTgUpdateId": 0,
-  "h1TrendEpoch": 1786881600,
-  "phaseATriggeredEpoch": 1786842000,
-  "activeEntryType": null,
-  "pendingPullback": "SELL",
-  "pullbackEpoch": 1786906200,
-  "phaseBStochSeen": true,
-  "phaseBCciSeen": false,
-  "phaseBTdiSeen": false,
-  "phaseCTriggeredEpoch": 1786882800,
-  "phaseDTriggeredEpoch": null,
-  "anticipatedTrend": null,
-  "pullbackTrigger": null,
-  "rsiLowerBreakSeen": true,
-  "rsiUpperBreakSeen": true,
-  "h1m15WasAligned": false
+  "h1TrendEpoch": null,
+  "phaseATriggeredEpoch": null,
+  "activeEntryType": null
 }
