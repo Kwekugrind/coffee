@@ -700,7 +700,7 @@ async function runScanMode() {
         openTrade.peakProfit = pnl;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       }
-      const dropThreshold = openTrade.peakProfit * 0.20; 
+      const dropThreshold = openTrade.peakProfit * 0.50; 
       if (openTrade.peakProfit > 0 && pnl <= openTrade.peakProfit - dropThreshold) {
         const result = pnl >= 0 ? "WIN" : "LOSS";
         await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 20% drop from peak)`);
