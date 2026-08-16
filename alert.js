@@ -494,6 +494,24 @@ function calculateBollingerBands(data, period = 34, deviation = 1.619) {
   return { upper, middle, lower };
 }
 
+function getBGAInfo(price) {
+  let step = 100;
+  if (price > 20000) step = 500;
+  else if (price > 10000) step = 200;
+  else if (price > 5000) step = 100;
+  else if (price > 2000) step = 50;
+  else if (price > 1000) step = 20;
+  else step = 10;
+
+  const whole = Math.round(price / step) * step;
+  const half = whole - (step / 2);
+  const isWhole = Math.abs(price - whole) <= (step * 0.05);
+  const isHalf = Math.abs(price - half) <= (step * 0.05);
+  if (isWhole) return `BGA Whole Level (${whole})`;
+  if (isHalf) return `BGA Half Level (${half})`;
+  return `BGA Zone (Near ${whole})`;
+}
+
 function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
   let step = 100;
   if (entry > 20000) step = 500;
@@ -682,7 +700,7 @@ async function runScanMode() {
         openTrade.peakProfit = pnl;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       }
-      const dropThreshold = openTrade.peakProfit * 0.50; 
+      const dropThreshold = openTrade.peakProfit * 0.20; 
       if (openTrade.peakProfit > 0 && pnl <= openTrade.peakProfit - dropThreshold) {
         const result = pnl >= 0 ? "WIN" : "LOSS";
         await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 20% drop from peak)`);
