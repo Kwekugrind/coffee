@@ -700,7 +700,7 @@ async function runScanMode() {
         openTrade.peakProfit = pnl;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       }
-      const dropThreshold = openTrade.peakProfit * 0.50; 
+      const dropThreshold = openTrade.peakProfit * 0.20; 
       if (openTrade.peakProfit > 0 && pnl <= openTrade.peakProfit - dropThreshold) {
         const result = pnl >= 0 ? "WIN" : "LOSS";
         await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 20% drop from peak)`);
@@ -888,7 +888,7 @@ async function runScanMode() {
 // ==================== EXECUTION MODES ====================
 (async () => {
   const REPO_INDEX = { R_10: 0, R_50: 1, R_75: 2, "1HZ75V": 3, R_100: 4, R_25: 5, "1HZ100V": 6 }[SYMBOL] ?? 0;
-  const jitterMs = (REPO_INDEX * 4000) + Math.floor(Math.random() * 2000);
+  const jitterMs = (REPO_INDEX * 12000) + Math.floor(Math.random() * 3000);
   
   dbg(`Staggering execution by ${jitterMs}ms (Repo Index: ${REPO_INDEX})...`);
   await new Promise(r => setTimeout(r, jitterMs));
