@@ -11,10 +11,10 @@ import fs from "fs";
 // const SYMBOL = "R_50"; const SYMBOL_NAME = "Volatility 50 Index"; const REPO_LABEL = "OmniSight (V50)"; const MULTIPLIER = 80; const COMMISSION_USD = 0.16;
 
 // --- 3. Lery's Alerts (Demo) ---
-// const SYMBOL = "R_75"; const SYMBOL_NAME = "Volatility 75 Index"; const REPO_LABEL = "Lery's Alerts (V75 Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
+const SYMBOL = "R_75"; const SYMBOL_NAME = "Volatility 75 Index"; const REPO_LABEL = "Lery's Alerts (V75 Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
 
 // --- 4. Coffee (Demo) ---
-const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const REPO_LABEL = "Coffee (V75-1s Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
+// const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const REPO_LABEL = "Coffee (V75-1s Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
 
 // --- 5. Milk (Demo) ---
 // const SYMBOL = "R_100"; const SYMBOL_NAME = "Volatility 100 Index"; const REPO_LABEL = "Milk (V100 Demo)"; const MULTIPLIER = 40; const COMMISSION_USD = 0.15;
@@ -32,7 +32,6 @@ const SAFETY_TP_USD = 10.00; // $10 flat profit insurance ceiling on broker side
 const BREAKEVEN_ACTIVATE_USD = 2.00; // Move SL to entry once profit hits $2.00
 const ATR_PERIOD = 14;
 const ATR_MULTIPLIER = 2.0; // Stop loss breathing room
-const SETUP_EXPIRY_BARS = 15; // Updated Phase B expiration bars
 const MARKET_DATA_APP_ID = "1089"; // Dedicated public App ID for unauthenticated candle data
 const DERIV_APP_ID = process.env.DERIV_APP_ID || "67418"; // Personal App ID for trading/OTP
 const TG_TOKEN = process.env.TG_BOT_TOKEN || process.env.TG_TOKEN;
@@ -173,8 +172,7 @@ async function executeManualClose(result, reason) {
 
 let state = { 
   waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, 
-  phaseATriggeredEpoch: null, activeEntryType: null,
-  pendingPullback: null, pullbackEpoch: null, phaseBStochSeen: false, phaseBCciSeen: false, phaseBTdiSeen: false 
+  phaseATriggeredEpoch: null, activeEntryType: null 
 };
 try {
   const s = JSON.parse(fs.readFileSync("state.json"));
@@ -184,12 +182,7 @@ try {
     setupEpoch: s.setupEpoch ?? null,
     h1TrendEpoch: s.h1TrendEpoch ?? null,
     phaseATriggeredEpoch: s.phaseATriggeredEpoch ?? null,
-    activeEntryType: s.activeEntryType ?? null,
-    pendingPullback: s.pendingPullback ?? null,
-    pullbackEpoch: s.pullbackEpoch ?? null,
-    phaseBStochSeen: s.phaseBStochSeen ?? false,
-    phaseBCciSeen: s.phaseBCciSeen ?? false,
-    phaseBTdiSeen: s.phaseBTdiSeen ?? false
+    activeEntryType: s.activeEntryType ?? null
   };
 } catch {}
 
@@ -733,16 +726,11 @@ async function runScanMode() {
     }
   }
 
-  // H1 Invalidation / Reset Rule: If H1 changes direction, update waitingFor and reset setup
+  // H1 Invalidation / Reset Rule: If H1 changes direction, update waitingFor
   if (h1TrendDir) {
     if (state.waitingFor !== h1TrendDir) {
       dbg(`H1 trend change detected: switching waitingFor to ${h1TrendDir}`);
       state.waitingFor = h1TrendDir;
-      state.pendingPullback = null;
-      state.pullbackEpoch = null;
-      state.phaseBStochSeen = false;
-      state.phaseBCciSeen = false;
-      state.phaseBTdiSeen = false;
     }
   } else {
     state.waitingFor = null;
@@ -790,28 +778,21 @@ async function runScanMode() {
       entryType = 'PHASE_A';
     }
 
-    // --- PHASE B: Stateful Pullback / Re-entry Engine ---
+    // --- PHASE B: Simultaneous Confluence Pullback Engine (with Fresh Catalyst) ---
     if (!signalTriggered) {
-      // Check Expiration (15 bars starting from first seen trigger)
-      if (state.pendingPullback && state.pullbackEpoch && (currentCandleEpoch - state.pullbackEpoch) > (SETUP_EXPIRY_BARS * M5)) {
-        dbg("Phase B setup expired (15 bars reached). Resetting.");
-        state.pendingPullback = null;
-        state.pullbackEpoch = null;
-        state.phaseBStochSeen = false;
-        state.phaseBCciSeen = false;
-        state.phaseBTdiSeen = false;
-      }
+      const stochAlignedBuy = stoch.k[si] > 50 && stoch.d[si] > 50;
+      const stochAlignedSell = stoch.k[si] < 50 && stoch.d[si] < 50;
 
-      // Check Direction Shift Invalidation
-      if (state.pendingPullback && state.pendingPullback !== state.waitingFor) {
-        state.pendingPullback = null;
-        state.pullbackEpoch = null;
-        state.phaseBStochSeen = false;
-        state.phaseBCciSeen = false;
-        state.phaseBTdiSeen = false;
-      }
+      const cciAlignedBuy = cci[si] > 0;
+      const cciAlignedSell = cci[si] < 0;
 
-      // Indicator crosses for Phase B
+      const tdiAlignedBuy = rsi[si] > tdi.middle[si];
+      const tdiAlignedSell = rsi[si] < tdi.middle[si];
+
+      const allAlignedBuy = stochAlignedBuy && cciAlignedBuy && tdiAlignedBuy;
+      const allAlignedSell = stochAlignedSell && cciAlignedSell && tdiAlignedSell;
+
+      // Fresh catalyst crosses on current candle si
       const stochCrossBuyB = (stoch.k[si-1] <= 50 || stoch.d[si-1] <= 50) && (stoch.k[si] > 50 && stoch.d[si] > 50) && (stoch.k[si-1] <= stoch.d[si-1]) && (stoch.k[si] > stoch.d[si]);
       const stochCrossSellB = (stoch.k[si-1] >= 50 || stoch.d[si-1] >= 50) && (stoch.k[si] < 50 && stoch.d[si] < 50) && (stoch.k[si-1] >= stoch.d[si-1]) && (stoch.k[si] < stoch.d[si]);
 
@@ -821,51 +802,19 @@ async function runScanMode() {
       const tdiCrossBuyB = rsi[si-1] <= tdi.middle[si-1] && rsi[si] > tdi.middle[si];
       const tdiCrossSellB = rsi[si-1] >= tdi.middle[si-1] && rsi[si] < tdi.middle[si];
 
-      if (state.waitingFor === "BUY") {
-        const gotStoch = stochCrossBuyB;
-        const gotCci = cciCrossBuyB;
-        const gotTdi = tdiCrossBuyB;
+      const freshCatalystBuy = stochCrossBuyB || cciCrossBuyB || tdiCrossBuyB;
+      const freshCatalystSell = stochCrossSellB || cciCrossSellB || tdiCrossSellB;
 
-        if (gotStoch || gotCci || gotTdi) {
-          if (!state.pendingPullback) {
-            state.pendingPullback = "BUY";
-            state.pullbackEpoch = currentCandleEpoch; // Start 15-bar timer on first trigger
-            dbg("Phase B BUY setup armed.");
-          }
-          if (gotStoch) state.phaseBStochSeen = true;
-          if (gotCci) state.phaseBCciSeen = true;
-          if (gotTdi) state.phaseBTdiSeen = true;
-        }
-
-        if (state.pendingPullback === "BUY" && state.phaseBStochSeen && state.phaseBCciSeen && state.phaseBTdiSeen) {
-          signalTriggered = true;
-          direction = "BUY";
-          entry = closes[i];
-          entryType = 'PHASE_B';
-        }
-
-      } else if (state.waitingFor === "SELL") {
-        const gotStoch = stochCrossSellB;
-        const gotCci = cciCrossSellB;
-        const gotTdi = tdiCrossSellB;
-
-        if (gotStoch || gotCci || gotTdi) {
-          if (!state.pendingPullback) {
-            state.pendingPullback = "SELL";
-            state.pullbackEpoch = currentCandleEpoch; // Start 15-bar timer on first trigger
-            dbg("Phase B SELL setup armed.");
-          }
-          if (gotStoch) state.phaseBStochSeen = true;
-          if (gotCci) state.phaseBCciSeen = true;
-          if (gotTdi) state.phaseBTdiSeen = true;
-        }
-
-        if (state.pendingPullback === "SELL" && state.phaseBStochSeen && state.phaseBCciSeen && state.phaseBTdiSeen) {
-          signalTriggered = true;
-          direction = "SELL";
-          entry = closes[i];
-          entryType = 'PHASE_B';
-        }
+      if (state.waitingFor === "BUY" && allAlignedBuy && freshCatalystBuy) {
+        signalTriggered = true;
+        direction = "BUY";
+        entry = closes[i];
+        entryType = 'PHASE_B';
+      } else if (state.waitingFor === "SELL" && allAlignedSell && freshCatalystSell) {
+        signalTriggered = true;
+        direction = "SELL";
+        entry = closes[i];
+        entryType = 'PHASE_B';
       }
     }
   }
@@ -888,7 +837,7 @@ async function runScanMode() {
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Stateful Confluence)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Simultaneous Confluence)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
     try {
       const contractId = await executeTrade(direction);
@@ -911,11 +860,6 @@ async function runScanMode() {
     }
 
     state.waitingFor = null;
-    state.pendingPullback = null;
-    state.pullbackEpoch = null;
-    state.phaseBStochSeen = false;
-    state.phaseBCciSeen = false;
-    state.phaseBTdiSeen = false;
   }
 
   state.lastProcessedEpoch = currentCandleEpoch;
