@@ -732,26 +732,27 @@ async function runScanMode() {
   const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
   const atr14 = calculateATR(candles, ATR_PERIOD);
 
-  // 1. Evaluate H1 Trend Direction (Closed H1 Candle: length - 2) relative to EMA 50
-  let h1TrendDir = null;
+  // 1. Evaluate Fresh H1 Cross relative to EMA 50 (Closed H1 Candle: length - 2)
+  let h1FreshBuy = false;
+  let h1FreshSell = false;
   if (h1Candles && h1Candles.length >= 52) {
     const h1Closes = h1Candles.map(c => parseFloat(c.close));
     const h1ci = h1Candles.length - 2; // Closed H1 candle
+    const h1PrevCi = h1ci - 1;         // Previous H1 candle
     const sma50_1h = sma(h1Closes, 50);
-    if (sma50_1h[h1ci] != null) {
-      if (h1Closes[h1ci] > sma50_1h[h1ci]) h1TrendDir = "BUY";
-      else if (h1Closes[h1ci] < sma50_1h[h1ci]) h1TrendDir = "SELL";
+    
+    if (sma50_1h[h1ci] != null && sma50_1h[h1PrevCi] != null) {
+      h1FreshBuy = (h1Closes[h1PrevCi] <= sma50_1h[h1PrevCi]) && (h1Closes[h1ci] > sma50_1h[h1ci]);
+      h1FreshSell = (h1Closes[h1PrevCi] >= sma50_1h[h1PrevCi]) && (h1Closes[h1ci] < sma50_1h[h1ci]);
     }
   }
 
-  // H1 Invalidation / Reset Rule: If H1 changes direction, update waitingFor
-  if (h1TrendDir) {
-    if (state.waitingFor !== h1TrendDir) {
-      dbg(`H1 trend change detected: switching waitingFor to ${h1TrendDir}`);
-      state.waitingFor = h1TrendDir;
-    }
-  } else {
-    state.waitingFor = null;
+  if (h1FreshBuy) {
+    dbg("Fresh H1 BUY cross detected. Arming BUY setup.");
+    state.waitingFor = "BUY";
+  } else if (h1FreshSell) {
+    dbg("Fresh H1 SELL cross detected. Arming SELL setup.");
+    state.waitingFor = "SELL";
   }
 
   if (!state.waitingFor) {
