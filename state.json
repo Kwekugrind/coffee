@@ -1,7 +1,7 @@
 {
-  "waitingFor": null,
+  "waitingFor": "SELL",
   "setupEpoch": null,
-  "lastProcessedEpoch": null,
+  "lastProcessedEpoch": 1786914300,
   "lastTgUpdateId": 0,
   "h1TrendEpoch": null,
   "phaseATriggeredEpoch": null,
