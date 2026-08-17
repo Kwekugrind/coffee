@@ -172,7 +172,8 @@ async function executeManualClose(result, reason) {
 
 let state = { 
   waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, 
-  phaseATriggeredEpoch: null, activeEntryType: null, phaseATaken: false 
+  phaseATriggeredEpoch: null, activeEntryType: null, phaseATaken: false,
+  phaseBPending: null, phaseBStochFreshSeen: false, phaseBCciFreshSeen: false, phaseBTdiFreshSeen: false
 };
 try {
   const s = JSON.parse(fs.readFileSync("state.json"));
@@ -183,7 +184,11 @@ try {
     h1TrendEpoch: s.h1TrendEpoch ?? null,
     phaseATriggeredEpoch: s.phaseATriggeredEpoch ?? null,
     activeEntryType: s.activeEntryType ?? null,
-    phaseATaken: s.phaseATaken ?? false
+    phaseATaken: s.phaseATaken ?? false,
+    phaseBPending: s.phaseBPending ?? null,
+    phaseBStochFreshSeen: s.phaseBStochFreshSeen ?? false,
+    phaseBCciFreshSeen: s.phaseBCciFreshSeen ?? false,
+    phaseBTdiFreshSeen: s.phaseBTdiFreshSeen ?? false
   };
 } catch {}
 
@@ -752,10 +757,18 @@ async function runScanMode() {
     dbg("Fresh H1 BUY cross detected. Arming Phase A BUY.");
     state.waitingFor = "BUY";
     state.phaseATaken = false; // Reset so Phase A takes the first trade
+    state.phaseBPending = null;
+    state.phaseBStochFreshSeen = false;
+    state.phaseBCciFreshSeen = false;
+    state.phaseBTdiFreshSeen = false;
   } else if (h1FreshSell) {
     dbg("Fresh H1 SELL cross detected. Arming Phase A SELL.");
     state.waitingFor = "SELL";
     state.phaseATaken = false; // Reset so Phase A takes the first trade
+    state.phaseBPending = null;
+    state.phaseBStochFreshSeen = false;
+    state.phaseBCciFreshSeen = false;
+    state.phaseBTdiFreshSeen = false;
   }
 
   if (!state.waitingFor) {
@@ -804,21 +817,8 @@ async function runScanMode() {
       }
     }
 
-    // --- PHASE B: Re-entries only AFTER Phase A has been taken ---
+    // --- PHASE B: Stateful Sequential Fresh-Cross Engine (Only AFTER Phase A) ---
     if (!signalTriggered && state.phaseATaken) {
-      const stochAlignedBuy = stoch.k[si] > 50 && stoch.d[si] > 50;
-      const stochAlignedSell = stoch.k[si] < 50 && stoch.d[si] < 50;
-
-      const cciAlignedBuy = cci[si] > 0;
-      const cciAlignedSell = cci[si] < 0;
-
-      const tdiAlignedBuy = rsi[si] > tdi.middle[si];
-      const tdiAlignedSell = rsi[si] < tdi.middle[si];
-
-      const allAlignedBuy = stochAlignedBuy && cciAlignedBuy && tdiAlignedBuy;
-      const allAlignedSell = stochAlignedSell && cciAlignedSell && tdiAlignedSell;
-
-      // Fresh catalyst crosses on current candle si
       const stochCrossBuyB = (stoch.k[si-1] <= 50 || stoch.d[si-1] <= 50) && (stoch.k[si] > 50 && stoch.d[si] > 50) && (stoch.k[si-1] <= stoch.d[si-1]) && (stoch.k[si] > stoch.d[si]);
       const stochCrossSellB = (stoch.k[si-1] >= 50 || stoch.d[si-1] >= 50) && (stoch.k[si] < 50 && stoch.d[si] < 50) && (stoch.k[si-1] >= stoch.d[si-1]) && (stoch.k[si] < stoch.d[si]);
 
@@ -828,19 +828,81 @@ async function runScanMode() {
       const tdiCrossBuyB = rsi[si-1] <= tdi.middle[si-1] && rsi[si] > tdi.middle[si];
       const tdiCrossSellB = rsi[si-1] >= tdi.middle[si-1] && rsi[si] < tdi.middle[si];
 
-      const freshCatalystBuy = stochCrossBuyB || cciCrossBuyB || tdiCrossBuyB;
-      const freshCatalystSell = stochCrossSellB || cciCrossSellB || tdiCrossSellB;
+      if (state.waitingFor === "BUY") {
+        // De-alignment reset checks
+        if (stoch.k[si] < 50) state.phaseBStochFreshSeen = false;
+        if (cci[si] < 0) state.phaseBCciFreshSeen = false;
+        if (rsi[si] < tdi.middle[si]) state.phaseBTdiFreshSeen = false;
 
-      if (state.waitingFor === "BUY" && allAlignedBuy && freshCatalystBuy) {
-        signalTriggered = true;
-        direction = "BUY";
-        entry = closes[i];
-        entryType = 'PHASE_B';
-      } else if (state.waitingFor === "SELL" && allAlignedSell && freshCatalystSell) {
-        signalTriggered = true;
-        direction = "SELL";
-        entry = closes[i];
-        entryType = 'PHASE_B';
+        // If not pending yet, require a fresh cross to arm Phase B
+        if (!state.phaseBPending) {
+          if (stochCrossBuyB || cciCrossBuyB || tdiCrossBuyB) {
+            state.phaseBPending = "BUY";
+            if (stochCrossBuyB) state.phaseBStochFreshSeen = true;
+            if (cciCrossBuyB) state.phaseBCciFreshSeen = true;
+            if (tdiCrossBuyB) state.phaseBTdiFreshSeen = true;
+            dbg("Phase B BUY armed by initial fresh cross.");
+          }
+        } else {
+          // Once armed, record any additional fresh crosses as they occur
+          if (stochCrossBuyB) state.phaseBStochFreshSeen = true;
+          if (cciCrossBuyB) state.phaseBCciFreshSeen = true;
+          if (tdiCrossBuyB) state.phaseBTdiFreshSeen = true;
+        }
+
+        if (state.phaseBPending === "BUY" && !state.phaseBStochFreshSeen && !state.phaseBCciFreshSeen && !state.phaseBTdiFreshSeen) {
+          state.phaseBPending = null;
+        }
+
+        if (state.phaseBPending === "BUY" && state.phaseBStochFreshSeen && state.phaseBCciFreshSeen && state.phaseBTdiFreshSeen) {
+          signalTriggered = true;
+          direction = "BUY";
+          entry = closes[i];
+          entryType = 'PHASE_B';
+          // Reset Phase B state after firing
+          state.phaseBPending = null;
+          state.phaseBStochFreshSeen = false;
+          state.phaseBCciFreshSeen = false;
+          state.phaseBTdiFreshSeen = false;
+        }
+
+      } else if (state.waitingFor === "SELL") {
+        // De-alignment reset checks
+        if (stoch.k[si] > 50) state.phaseBStochFreshSeen = false;
+        if (cci[si] > 0) state.phaseBCciFreshSeen = false;
+        if (rsi[si] > tdi.middle[si]) state.phaseBTdiFreshSeen = false;
+
+        // If not pending yet, require a fresh cross to arm Phase B
+        if (!state.phaseBPending) {
+          if (stochCrossSellB || cciCrossSellB || tdiCrossSellB) {
+            state.phaseBPending = "SELL";
+            if (stochCrossSellB) state.phaseBStochFreshSeen = true;
+            if (cciCrossSellB) state.phaseBCciFreshSeen = true;
+            if (tdiCrossSellB) state.phaseBTdiFreshSeen = true;
+            dbg("Phase B SELL armed by initial fresh cross.");
+          }
+        } else {
+          // Once armed, record any additional fresh crosses
+          if (stochCrossSellB) state.phaseBStochFreshSeen = true;
+          if (cciCrossSellB) state.phaseBCciFreshSeen = true;
+          if (tdiCrossSellB) state.phaseBTdiFreshSeen = true;
+        }
+
+        if (state.phaseBPending === "SELL" && !state.phaseBStochFreshSeen && !state.phaseBCciFreshSeen && !state.phaseBTdiFreshSeen) {
+          state.phaseBPending = null;
+        }
+
+        if (state.phaseBPending === "SELL" && state.phaseBStochFreshSeen && state.phaseBCciFreshSeen && state.phaseBTdiFreshSeen) {
+          signalTriggered = true;
+          direction = "SELL";
+          entry = closes[i];
+          entryType = 'PHASE_B';
+          // Reset Phase B state after firing
+          state.phaseBPending = null;
+          state.phaseBStochFreshSeen = false;
+          state.phaseBCciFreshSeen = false;
+          state.phaseBTdiFreshSeen = false;
+        }
       }
     }
   }
@@ -863,7 +925,7 @@ async function runScanMode() {
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Sequence Enforcement)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Sequential Fresh Cross)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
     try {
       const contractId = await executeTrade(direction);
