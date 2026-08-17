@@ -1,10 +1,14 @@
 {
   "waitingFor": null,
   "setupEpoch": null,
-  "lastProcessedEpoch": 1786955100,
+  "lastProcessedEpoch": 1786955400,
   "lastTgUpdateId": 0,
   "h1TrendEpoch": null,
   "phaseATriggeredEpoch": null,
   "activeEntryType": null,
-  "phaseATaken": false
+  "phaseATaken": false,
+  "phaseBPending": null,
+  "phaseBStochFreshSeen": false,
+  "phaseBCciFreshSeen": false,
+  "phaseBTdiFreshSeen": false
 }
