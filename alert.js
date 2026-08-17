@@ -172,7 +172,7 @@ async function executeManualClose(result, reason) {
 
 let state = { 
   waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, 
-  phaseATriggeredEpoch: null, activeEntryType: null, phaseATaken: false,
+  phaseATriggeredEpoch: null, activeEntryType: null, phaseATaken: false, h1TrendCycleEpoch: null,
   phaseBPending: null, phaseBStochFreshSeen: false, phaseBCciFreshSeen: false, phaseBTdiFreshSeen: false
 };
 try {
@@ -185,6 +185,7 @@ try {
     phaseATriggeredEpoch: s.phaseATriggeredEpoch ?? null,
     activeEntryType: s.activeEntryType ?? null,
     phaseATaken: s.phaseATaken ?? false,
+    h1TrendCycleEpoch: s.h1TrendCycleEpoch ?? null,
     phaseBPending: s.phaseBPending ?? null,
     phaseBStochFreshSeen: s.phaseBStochFreshSeen ?? false,
     phaseBCciFreshSeen: s.phaseBCciFreshSeen ?? false,
@@ -368,7 +369,7 @@ async function closeContract(contractId) {
     const errCode = data.error?.code || data.errors?.code;
     const errStr = String(JSON.stringify(data));
     
-    if (errCode !== "ContractNotFound" && (data.error || data.errors || errStr.includes("429") || errStr.includes("RateLimit"))) {
+    if (errCode !== "ContractNotFound" && (data.error || data.errors || errStr.includes("429" || errStr.includes("RateLimit")))) {
       throw new Error(`429/RateLimit/Error: ${errStr}`);
     }
     return data;
@@ -709,7 +710,7 @@ async function runScanMode() {
         openTrade.peakProfit = pnl;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       }
-      const dropThreshold = openTrade.peakProfit * 0.20; 
+      const dropThreshold = openTrade.peakProfit * 0.50; 
       if (openTrade.peakProfit > 0 && pnl <= openTrade.peakProfit - dropThreshold) {
         const result = pnl >= 0 ? "WIN" : "LOSS";
         await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 20% drop from peak)`);
@@ -744,6 +745,7 @@ async function runScanMode() {
   // 1. Evaluate Fresh H1 Cross relative to EMA 50 (Closed H1 Candle: length - 2)
   let h1FreshBuy = false;
   let h1FreshSell = false;
+  let h1TrendDir = null;
   if (h1Candles && h1Candles.length >= 52) {
     const h1Closes = h1Candles.map(c => parseFloat(c.close));
     const h1ci = h1Candles.length - 2; // Closed H1 candle
@@ -753,13 +755,18 @@ async function runScanMode() {
     if (sma50_1h[h1ci] != null && sma50_1h[h1PrevCi] != null) {
       h1FreshBuy = (h1Closes[h1PrevCi] <= sma50_1h[h1PrevCi]) && (h1Closes[h1ci] > sma50_1h[h1ci]);
       h1FreshSell = (h1Closes[h1PrevCi] >= sma50_1h[h1PrevCi]) && (h1Closes[h1ci] < sma50_1h[h1ci]);
+
+      if (h1Closes[h1ci] > sma50_1h[h1ci]) h1TrendDir = "BUY";
+      else if (h1Closes[h1ci] < sma50_1h[h1ci]) h1TrendDir = "SELL";
     }
   }
 
+  // If a fresh H1 cross occurs, record its exact epoch and arm Phase A
   if (h1FreshBuy) {
     dbg("Fresh H1 BUY cross detected. Arming Phase A BUY.");
     state.waitingFor = "BUY";
-    state.phaseATaken = false; // Reset so Phase A takes the first trade
+    state.phaseATaken = false; 
+    state.h1TrendCycleEpoch = h1Candles[h1Candles.length - 2].epoch;
     state.phaseBPending = null;
     state.phaseBStochFreshSeen = false;
     state.phaseBCciFreshSeen = false;
@@ -767,7 +774,20 @@ async function runScanMode() {
   } else if (h1FreshSell) {
     dbg("Fresh H1 SELL cross detected. Arming Phase A SELL.");
     state.waitingFor = "SELL";
-    state.phaseATaken = false; // Reset so Phase A takes the first trade
+    state.phaseATaken = false; 
+    state.h1TrendCycleEpoch = h1Candles[h1Candles.length - 2].epoch;
+    state.phaseBPending = null;
+    state.phaseBStochFreshSeen = false;
+    state.phaseBCciFreshSeen = false;
+    state.phaseBTdiFreshSeen = false;
+  }
+
+  // Invalidation Rule: If H1 trend flips against waitingFor, reset everything
+  if (h1TrendDir && state.waitingFor && h1TrendDir !== state.waitingFor) {
+    dbg("H1 trend flipped against waitingFor. Resetting state.");
+    state.waitingFor = null;
+    state.phaseATaken = false;
+    state.h1TrendCycleEpoch = null;
     state.phaseBPending = null;
     state.phaseBStochFreshSeen = false;
     state.phaseBCciFreshSeen = false;
@@ -832,7 +852,7 @@ async function runScanMode() {
       const tdiCrossSellB = rsi[si-1] >= tdi.middle[si-1] && rsi[si] < tdi.middle[si];
 
       if (state.waitingFor === "BUY") {
-        // De-alignment reset checks: only reset the specific indicator that de-aligns
+        // De-alignment reset checks
         if (stoch.k[si] < 50) state.phaseBStochFreshSeen = false;
         if (cci[si] < 0) state.phaseBCciFreshSeen = false;
         if (rsi[si] < tdi.middle[si]) state.phaseBTdiFreshSeen = false;
@@ -847,7 +867,6 @@ async function runScanMode() {
             dbg("Phase B BUY armed by initial fresh cross.");
           }
         } else {
-          // Once armed, record additional fresh crosses as they occur
           if (stochCrossBuyB) state.phaseBStochFreshSeen = true;
           if (cciCrossBuyB) state.phaseBCciFreshSeen = true;
           if (tdiCrossBuyB) state.phaseBTdiFreshSeen = true;
@@ -857,13 +876,11 @@ async function runScanMode() {
           state.phaseBPending = null;
         }
 
-        // Fire trade only when ALL THREE have recorded fresh crosses and remain in alignment
         if (state.phaseBPending === "BUY" && state.phaseBStochFreshSeen && state.phaseBCciFreshSeen && state.phaseBTdiFreshSeen) {
           signalTriggered = true;
           direction = "BUY";
           entry = closes[i];
           entryType = 'PHASE_B';
-          // Reset Phase B state after firing
           state.phaseBPending = null;
           state.phaseBStochFreshSeen = false;
           state.phaseBCciFreshSeen = false;
@@ -871,7 +888,7 @@ async function runScanMode() {
         }
 
       } else if (state.waitingFor === "SELL") {
-        // De-alignment reset checks: only reset the specific indicator that de-aligns
+        // De-alignment reset checks
         if (stoch.k[si] > 50) state.phaseBStochFreshSeen = false;
         if (cci[si] > 0) state.phaseBCciFreshSeen = false;
         if (rsi[si] > tdi.middle[si]) state.phaseBTdiFreshSeen = false;
@@ -886,7 +903,6 @@ async function runScanMode() {
             dbg("Phase B SELL armed by initial fresh cross.");
           }
         } else {
-          // Once armed, record additional fresh crosses
           if (stochCrossSellB) state.phaseBStochFreshSeen = true;
           if (cciCrossSellB) state.phaseBCciFreshSeen = true;
           if (tdiCrossSellB) state.phaseBTdiFreshSeen = true;
@@ -896,13 +912,11 @@ async function runScanMode() {
           state.phaseBPending = null;
         }
 
-        // Fire trade only when ALL THREE have recorded fresh crosses and remain in alignment
         if (state.phaseBPending === "SELL" && state.phaseBStochFreshSeen && state.phaseBCciFreshSeen && state.phaseBTdiFreshSeen) {
           signalTriggered = true;
           direction = "SELL";
           entry = closes[i];
           entryType = 'PHASE_B';
-          // Reset Phase B state after firing
           state.phaseBPending = null;
           state.phaseBStochFreshSeen = false;
           state.phaseBCciFreshSeen = false;
@@ -930,7 +944,7 @@ async function runScanMode() {
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.entry ? entry.entry.toFixed(4) : entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Strict Fresh-Cross Sequence)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Cycle Enforcement)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
     try {
       const contractId = await executeTrade(direction);
@@ -967,7 +981,7 @@ async function runScanMode() {
   await new Promise(r => setTimeout(r, jitterMs));
 
   if (MODE === "daily") { await runSummary("Daily"); return; }
-  if (MODE === "weekly") { await runSummary("Weekly"); return; }
+  if (MODE === "weekly") { await runSummary("Monthly"); return; }
   if (MODE === "monthly") { await runSummary("Monthly"); return; }
   if (MODE === "close_win") { await executeManualClose("WIN", "manual command"); return; }
   if (MODE === "close_loss") { await executeManualClose("LOSS", "manual command"); return; }
