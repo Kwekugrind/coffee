@@ -687,7 +687,7 @@ async function runScanMode() {
       await sendTelegram(`⚖️ *${REPO_LABEL} — Breakeven Armed*\nProfit reached $${BREAKEVEN_ACTIVATE_USD.toFixed(2)}. Price floor locked at entry (${openTrade.entry.toFixed(4)}).`);
     }
 
-    // COMMISSION-COVERED BREAKEVEN TRIGGER: Close early to lock in +$0.50 net profit
+    // COMMISSION-COVERED BREAKEVEN TRIGGER: Close early on pullback to lock in +$0.50 net profit
     const targetNetProfit = 0.50;
     const requiredRawPnl = targetNetProfit + COMMISSION_USD;
     const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
@@ -696,8 +696,8 @@ async function runScanMode() {
       : openTrade.entry * (1 - priceMoveFraction);
 
     const breakevenHit = openTrade.breakevenSet && !openTrade.tp1Reached && (
-      (openTrade.direction === "BUY" && currentPrice >= breakevenPrice) ||
-      (openTrade.direction === "SELL" && currentPrice <= breakevenPrice)
+      (openTrade.direction === "BUY" && currentPrice <= breakevenPrice) ||
+      (openTrade.direction === "SELL" && currentPrice >= breakevenPrice)
     );
     if (breakevenHit) {
       await closeWith("WIN", `Commission-Covered Breakeven exit — locked +$0.50 net profit at price ${breakevenPrice.toFixed(4)}`);
@@ -734,7 +734,7 @@ async function runScanMode() {
         openTrade.peakProfit = pnl;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       }
-      const dropThreshold = openTrade.peakProfit * 0.50; // Updated to 50%
+      const dropThreshold = openTrade.peakProfit * 0.50; 
       if (openTrade.peakProfit > 0 && pnl <= openTrade.peakProfit - dropThreshold) {
         const result = pnl >= 0 ? "WIN" : "LOSS";
         await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 50% drop from peak)`);
@@ -766,7 +766,7 @@ async function runScanMode() {
   const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
   const atr14 = calculateATR(candles, ATR_PERIOD);
 
-  // 1. Evaluate H1 Trend Direction and Fresh Crossover relative to EMA 50 (Closed H1 Candle: length - 2)
+  // 1. Evaluate Fresh H1 Cross relative to EMA 50 (Closed H1 Candle: length - 2)
   let h1FreshBuy = false;
   let h1FreshSell = false;
   let h1TrendDir = null;
@@ -974,7 +974,7 @@ async function runScanMode() {
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + 50% Trailing)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Breakeven Protected)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
     try {
       const contractId = await executeTrade(direction);
