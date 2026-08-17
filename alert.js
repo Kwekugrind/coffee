@@ -369,7 +369,7 @@ async function closeContract(contractId) {
     const errCode = data.error?.code || data.errors?.code;
     const errStr = String(JSON.stringify(data));
     
-    if (errCode !== "ContractNotFound" && (data.error || data.errors || errStr.includes("429" || errStr.includes("RateLimit")))) {
+    if (errCode !== "ContractNotFound" && (data.error || data.errors || errStr.includes("429") || errStr.includes("RateLimit"))) {
       throw new Error(`429/RateLimit/Error: ${errStr}`);
     }
     return data;
@@ -680,6 +680,30 @@ async function runScanMode() {
       await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
     };
 
+    // BREAKEVEN PROTECTION: Arm once profit hits $2.00
+    if (!openTrade.tp1Reached && !openTrade.breakevenSet && pnl >= BREAKEVEN_ACTIVATE_USD) {
+      openTrade.breakevenSet = true;
+      fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+      await sendTelegram(`⚖️ *${REPO_LABEL} — Breakeven Armed*\nProfit reached $${BREAKEVEN_ACTIVATE_USD.toFixed(2)}. Price floor locked at entry (${openTrade.entry.toFixed(4)}).`);
+    }
+
+    // COMMISSION-COVERED BREAKEVEN TRIGGER: Close early to lock in +$0.50 net profit
+    const targetNetProfit = 0.50;
+    const requiredRawPnl = targetNetProfit + COMMISSION_USD;
+    const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
+    const breakevenPrice = openTrade.direction === "BUY"
+      ? openTrade.entry * (1 + priceMoveFraction)
+      : openTrade.entry * (1 - priceMoveFraction);
+
+    const breakevenHit = openTrade.breakevenSet && !openTrade.tp1Reached && (
+      (openTrade.direction === "BUY" && currentPrice >= breakevenPrice) ||
+      (openTrade.direction === "SELL" && currentPrice <= breakevenPrice)
+    );
+    if (breakevenHit) {
+      await closeWith("WIN", `Commission-Covered Breakeven exit — locked +$0.50 net profit at price ${breakevenPrice.toFixed(4)}`);
+      return;
+    }
+
     // 1. Hard SL Price Check
     const slBreached = openTrade.direction === "BUY" ? currentPrice <= openTrade.sl : currentPrice >= openTrade.sl;
     if (slBreached) {
@@ -694,26 +718,26 @@ async function runScanMode() {
       return;
     }
 
-    // 3. TP1 Price Level Hit (First BGA Whole Number) -> Arms 20% Peak-Drop Trailing
+    // 3. TP1 Price Level Hit (First BGA Whole Number) -> Arms 50% Peak-Drop Trailing
     if (!openTrade.tp1Reached) {
       const tp1Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1;
       if (tp1Hit) {
         openTrade.tp1Reached = true;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-        await sendTelegram(`🎯 TP1 BGA Whole Number reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — 20% peak-drop trailing now armed.`);
+        await sendTelegram(`🎯 TP1 BGA Whole Number reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — 50% peak-drop trailing now armed.`);
       }
     }
 
-    // 4. High-Water Mark Trailing (Activated at TP1 BGA Whole Number, exits if profit drops 20% from peak)
+    // 4. High-Water Mark Trailing (Activated at TP1 BGA Whole Number, exits if profit drops 50% from peak)
     if (openTrade.tp1Reached) {
       if (openTrade.peakProfit === null || pnl > openTrade.peakProfit) {
         openTrade.peakProfit = pnl;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       }
-      const dropThreshold = openTrade.peakProfit * 0.50; 
+      const dropThreshold = openTrade.peakProfit * 0.50; // Updated to 50%
       if (openTrade.peakProfit > 0 && pnl <= openTrade.peakProfit - dropThreshold) {
         const result = pnl >= 0 ? "WIN" : "LOSS";
-        await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 20% drop from peak)`);
+        await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 50% drop from peak)`);
         return;
       }
     }
@@ -742,7 +766,7 @@ async function runScanMode() {
   const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
   const atr14 = calculateATR(candles, ATR_PERIOD);
 
-  // 1. Evaluate Fresh H1 Cross relative to EMA 50 (Closed H1 Candle: length - 2)
+  // 1. Evaluate H1 Trend Direction and Fresh Crossover relative to EMA 50 (Closed H1 Candle: length - 2)
   let h1FreshBuy = false;
   let h1FreshSell = false;
   let h1TrendDir = null;
@@ -761,28 +785,27 @@ async function runScanMode() {
     }
   }
 
-  // If a fresh H1 cross occurs, record its exact epoch and arm Phase A
-  if (h1FreshBuy) {
-    dbg("Fresh H1 BUY cross detected. Arming Phase A BUY.");
-    state.waitingFor = "BUY";
-    state.phaseATaken = false; 
-    state.h1TrendCycleEpoch = h1Candles[h1Candles.length - 2].epoch;
-    state.phaseBPending = null;
-    state.phaseBStochFreshSeen = false;
-    state.phaseBCciFreshSeen = false;
-    state.phaseBTdiFreshSeen = false;
-  } else if (h1FreshSell) {
-    dbg("Fresh H1 SELL cross detected. Arming Phase A SELL.");
-    state.waitingFor = "SELL";
-    state.phaseATaken = false; 
-    state.h1TrendCycleEpoch = h1Candles[h1Candles.length - 2].epoch;
-    state.phaseBPending = null;
-    state.phaseBStochFreshSeen = false;
-    state.phaseBCciFreshSeen = false;
-    state.phaseBTdiFreshSeen = false;
+  // Check if we entered a NEW H1 trend cycle via a fresh crossover event
+  let h1NewCycleEpoch = null;
+  if (h1Candles && h1Candles.length >= 52) {
+    const h1ci = h1Candles.length - 2;
+    if (h1FreshBuy || h1FreshSell) {
+      h1NewCycleEpoch = h1Candles[h1ci].epoch;
+    }
   }
 
-  // Invalidation Rule: If H1 trend flips against waitingFor, reset everything
+  if (h1NewCycleEpoch && state.h1TrendCycleEpoch !== h1NewCycleEpoch) {
+    state.h1TrendCycleEpoch = h1NewCycleEpoch;
+    state.waitingFor = h1FreshBuy ? "BUY" : "SELL";
+    state.phaseATaken = false; // NEW H1 cycle means Phase A MUST happen first!
+    state.phaseBPending = null;
+    state.phaseBStochFreshSeen = false;
+    state.phaseBCciFreshSeen = false;
+    state.phaseBTdiFreshSeen = false;
+    dbg(`New H1 trend cycle detected at epoch ${h1NewCycleEpoch} (${state.waitingFor}). Phase A reset.`);
+  }
+
+  // Invalidation Rule: If H1 trend flips completely against waitingFor, reset
   if (h1TrendDir && state.waitingFor && h1TrendDir !== state.waitingFor) {
     dbg("H1 trend flipped against waitingFor. Resetting state.");
     state.waitingFor = null;
@@ -792,6 +815,13 @@ async function runScanMode() {
     state.phaseBStochFreshSeen = false;
     state.phaseBCciFreshSeen = false;
     state.phaseBTdiFreshSeen = false;
+  }
+
+  // If no H1 cycle has been established yet (e.g. fresh boot mid-trend), adopt current H1 trend and assume Phase A was already taken (so look for Phase B)
+  if (!state.waitingFor && h1TrendDir) {
+    state.waitingFor = h1TrendDir;
+    state.phaseATaken = true; // Assume mid-trend boot starts at Phase B re-entries
+    dbg(`Mid-trend boot detected. Adopting ${h1TrendDir} and setting phaseATaken = true.`);
   }
 
   if (!state.waitingFor) {
@@ -944,7 +974,7 @@ async function runScanMode() {
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Cycle Enforcement)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + 50% Trailing)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
     try {
       const contractId = await executeTrade(direction);
@@ -957,7 +987,8 @@ async function runScanMode() {
       trades.push({
         id: `${SYMBOL}-${isoTime}`, contractId, repo: REPO_LABEL, symbol: SYMBOL,
         direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry: null, tp1Reached: false,
-        peakProfit: null, rr: RISK_REWARD, entryType: entryType, openTime: timeFormatted, closeTime: null, result: null
+        breakevenSet: false, peakProfit: null, rr: RISK_REWARD, entryType: entryType, 
+        openTime: timeFormatted, closeTime: null, result: null
       });
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
     } catch (execErr) {
