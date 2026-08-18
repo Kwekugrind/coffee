@@ -218,7 +218,7 @@ async function withRetry(fn, retries = 3, delay = 4000) {
   }
 }
 
-// CONSOLIDATED DATA FETCHER (Opens ONE single WebSocket connection instead of separate ones)
+// CONSOLIDATED DATA FETCHER (Opens ONE single WebSocket connection instead of separate ones - 250 H1 candles for stable EMA 50)
 async function fetchAllData() {
   return withRetry(async () => {
     return new Promise((resolve, reject) => {
@@ -226,7 +226,7 @@ async function fetchAllData() {
       const results = {};
       ws.on("open", () => {
         ws.send(JSON.stringify({ req_id: 1, ticks_history: SYMBOL, granularity: M5, count: 120, end: "latest", style: "candles" }));
-        ws.send(JSON.stringify({ req_id: 2, ticks_history: SYMBOL, granularity: H1, count: 100, end: "latest", style: "candles" }));
+        ws.send(JSON.stringify({ req_id: 2, ticks_history: SYMBOL, granularity: H1, count: 250, end: "latest", style: "candles" }));
         ws.send(JSON.stringify({ req_id: 3, ticks_history: SYMBOL, granularity: M15, count: 100, end: "latest", style: "candles" }));
         ws.send(JSON.stringify({ req_id: 4, ticks_history: SYMBOL, granularity: H4, count: 10, end: "latest", style: "candles" }));
         ws.send(JSON.stringify({ req_id: 5, ticks_history: SYMBOL, granularity: D1, count: 5, end: "latest", style: "candles" }));
@@ -766,7 +766,7 @@ async function runScanMode() {
   const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
   const atr14 = calculateATR(candles, ATR_PERIOD);
 
-  // 1. Evaluate Fresh H1 Cross relative to EMA 50 (Closed H1 Candle: length - 2)
+  // 1. Evaluate Fresh H1 Crossover using EXPONENTIAL MOVING AVERAGE (EMA 50) over 250 H1 candles
   let h1FreshBuy = false;
   let h1FreshSell = false;
   let h1TrendDir = null;
@@ -774,14 +774,14 @@ async function runScanMode() {
     const h1Closes = h1Candles.map(c => parseFloat(c.close));
     const h1ci = h1Candles.length - 2; // Closed H1 candle
     const h1PrevCi = h1ci - 1;         // Previous H1 candle
-    const sma50_1h = sma(h1Closes, 50);
+    const ema50_1h = ema(h1Closes, 50); // <--- Using EMA 50
     
-    if (sma50_1h[h1ci] != null && sma50_1h[h1PrevCi] != null) {
-      h1FreshBuy = (h1Closes[h1PrevCi] <= sma50_1h[h1PrevCi]) && (h1Closes[h1ci] > sma50_1h[h1ci]);
-      h1FreshSell = (h1Closes[h1PrevCi] >= sma50_1h[h1PrevCi]) && (h1Closes[h1ci] < sma50_1h[h1ci]);
+    if (ema50_1h[h1ci] != null && ema50_1h[h1PrevCi] != null) {
+      h1FreshBuy = (h1Closes[h1PrevCi] <= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] > ema50_1h[h1ci]);
+      h1FreshSell = (h1Closes[h1PrevCi] >= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] < ema50_1h[h1ci]);
 
-      if (h1Closes[h1ci] > sma50_1h[h1ci]) h1TrendDir = "BUY";
-      else if (h1Closes[h1ci] < sma50_1h[h1ci]) h1TrendDir = "SELL";
+      if (h1Closes[h1ci] > ema50_1h[h1ci]) h1TrendDir = "BUY";
+      else if (h1Closes[h1ci] < ema50_1h[h1ci]) h1TrendDir = "SELL";
     }
   }
 
@@ -843,7 +843,9 @@ async function runScanMode() {
   if (si >= 1 && stoch.k[si] != null && stoch.d[si] != null && stoch.k[si-1] != null && stoch.d[si-1] != null &&
       cci[si] != null && cci[si-1] != null && rsi[si] != null && rsi[si-1] != null && tdi.middle[si] != null && tdi.middle[si-1] != null) {
 
-    // --- PHASE A: Must take the very first trade after a fresh H1 cross ---
+    // --- PHASE A: Must take the very first trade after a fresh H1 EMA 50 cross ---
+    // Rule: Phase A can ONLY trigger if state.waitingFor is active and phaseATaken is false.
+    // We wait for the M5 Stochastic cross in that direction.
     if (!state.phaseATaken) {
       const stochCrossBuyPhaseA = (stoch.k[si-1] <= 20 || stoch.d[si-1] <= 20) && 
                                   (stoch.k[si] > 20 && stoch.d[si] > 20) && 
@@ -974,7 +976,7 @@ async function runScanMode() {
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Breakeven Protected)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Audit Verified)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
     try {
       const contractId = await executeTrade(direction);
@@ -1011,11 +1013,26 @@ async function runScanMode() {
   dbg(`Staggering execution by ${jitterMs}ms (Repo Index: ${REPO_INDEX})...`);
   await new Promise(r => setTimeout(r, jitterMs));
 
-  if (MODE === "daily") { await runSummary("Daily"); return; }
-  if (MODE === "weekly") { await runSummary("Monthly"); return; }
-  if (MODE === "monthly") { await runSummary("Monthly"); return; }
-  if (MODE === "close_win") { await executeManualClose("WIN", "manual command"); return; }
-  if (MODE === "close_loss") { await executeManualClose("LOSS", "manual command"); return; }
+  if (MODE === "daily") {
+    await runSummary("Daily");
+    return;
+  }
+  if (MODE === "weekly") {
+    await runSummary("Weekly");
+    return;
+  }
+  if (MODE === "monthly") {
+    await runSummary("Monthly");
+    return;
+  }
+  if (MODE === "close_win") {
+    await executeManualClose("WIN", "manual command");
+    return;
+  }
+  if (MODE === "close_loss") {
+    await executeManualClose("LOSS", "manual command");
+    return;
+  }
   if (MODE === "test") {
     await sendTelegram(`🧪 Test mode active — ${REPO_LABEL}\nFiring a direct BUY trade via proxy...\nCheck your Deriv account for a MULTUP contract.`);
     try {
@@ -1026,6 +1043,9 @@ async function runScanMode() {
     }
     return;
   }
-  if (TRIGGER_SOURCE !== "cronjob") { console.log("Not a cronjob trigger — exiting."); return; }
+  if (TRIGGER_SOURCE !== "cronjob") {
+    console.log("Not a cronjob trigger — exiting.");
+    return;
+  }
   await runScanMode();
 })();
