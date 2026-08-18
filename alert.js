@@ -48,6 +48,8 @@ const H1 = 60 * 60;
 const H4 = 4 * 60 * 60;
 const D1 = 24 * 60 * 60;
 
+const PHASE_A_WINDOW_SECONDS = 2 * 60 * 60; // Strict 2-hour window for Phase A after H1 fresh cross
+
 const DEBUG = process.env.DEBUG === "true";
 function dbg(...a) { if (DEBUG) console.log("[DBG]", ...a); }
 
@@ -173,6 +175,7 @@ async function executeManualClose(result, reason) {
 let state = { 
   waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, 
   phaseATriggeredEpoch: null, activeEntryType: null, phaseATaken: false, h1TrendCycleEpoch: null,
+  phaseADeadlineEpoch: null, phaseAWindowExpired: false,
   phaseBPending: null, phaseBStochFreshSeen: false, phaseBCciFreshSeen: false, phaseBTdiFreshSeen: false
 };
 try {
@@ -186,6 +189,8 @@ try {
     activeEntryType: s.activeEntryType ?? null,
     phaseATaken: s.phaseATaken ?? false,
     h1TrendCycleEpoch: s.h1TrendCycleEpoch ?? null,
+    phaseADeadlineEpoch: s.phaseADeadlineEpoch ?? null,
+    phaseAWindowExpired: s.phaseAWindowExpired ?? false,
     phaseBPending: s.phaseBPending ?? null,
     phaseBStochFreshSeen: s.phaseBStochFreshSeen ?? false,
     phaseBCciFreshSeen: s.phaseBCciFreshSeen ?? false,
@@ -780,8 +785,10 @@ async function runScanMode() {
       h1FreshBuy = (h1Closes[h1PrevCi] <= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] > ema50_1h[h1ci]);
       h1FreshSell = (h1Closes[h1PrevCi] >= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] < ema50_1h[h1ci]);
 
-      if (h1Closes[h1ci] > ema50_1h[h1ci]) h1TrendDir = "BUY";
-      else if (h1Closes[h1ci] < ema50_1h[h1ci]) h1TrendDir = "SELL";
+      if (ema50_1h[h1ci] != null) {
+        if (h1Closes[h1ci] > ema50_1h[h1ci]) h1TrendDir = "BUY";
+        else if (h1Closes[h1ci] < ema50_1h[h1ci]) h1TrendDir = "SELL";
+      }
     }
   }
 
@@ -794,34 +801,42 @@ async function runScanMode() {
     }
   }
 
+  // Edit 1 — New H1 cycle detection: actually set the deadline
   if (h1NewCycleEpoch && state.h1TrendCycleEpoch !== h1NewCycleEpoch) {
     state.h1TrendCycleEpoch = h1NewCycleEpoch;
     state.waitingFor = h1FreshBuy ? "BUY" : "SELL";
     state.phaseATaken = false; // NEW H1 cycle means Phase A MUST happen first!
+    state.phaseAWindowExpired = false;
+    state.phaseADeadlineEpoch = h1NewCycleEpoch + PHASE_A_WINDOW_SECONDS;
     state.phaseBPending = null;
     state.phaseBStochFreshSeen = false;
     state.phaseBCciFreshSeen = false;
     state.phaseBTdiFreshSeen = false;
-    dbg(`New H1 trend cycle detected at epoch ${h1NewCycleEpoch} (${state.waitingFor}). Phase A reset.`);
+    dbg(`New H1 trend cycle detected at epoch ${h1NewCycleEpoch} (${state.waitingFor}). Phase A window open until ${new Date(state.phaseADeadlineEpoch*1000).toISOString()}.`);
   }
 
-  // Invalidation Rule: If H1 trend flips completely against waitingFor, reset
+  // Edit 2 — Trend invalidation: reset the new fields too
   if (h1TrendDir && state.waitingFor && h1TrendDir !== state.waitingFor) {
     dbg("H1 trend flipped against waitingFor. Resetting state.");
     state.waitingFor = null;
     state.phaseATaken = false;
     state.h1TrendCycleEpoch = null;
+    state.phaseADeadlineEpoch = null;
+    state.phaseAWindowExpired = false;
     state.phaseBPending = null;
     state.phaseBStochFreshSeen = false;
     state.phaseBCciFreshSeen = false;
     state.phaseBTdiFreshSeen = false;
   }
 
-  // If no H1 cycle has been established yet (e.g. fresh boot mid-trend), adopt current H1 trend and assume Phase A was already taken (so look for Phase B)
+  // Edit 3 — Restore a SAFE mid-trend boot fallback
   if (!state.waitingFor && h1TrendDir) {
     state.waitingFor = h1TrendDir;
-    state.phaseATaken = true; // Assume mid-trend boot starts at Phase B re-entries
-    dbg(`Mid-trend boot detected. Adopting ${h1TrendDir} and setting phaseATaken = true.`);
+    state.h1TrendCycleEpoch = currentCandleEpoch;
+    state.phaseATaken = false;
+    state.phaseAWindowExpired = false;
+    state.phaseADeadlineEpoch = currentCandleEpoch + PHASE_A_WINDOW_SECONDS;
+    dbg(`Mid-trend boot: adopting ${h1TrendDir}. Phase A window open until ${new Date(state.phaseADeadlineEpoch*1000).toISOString()}.`);
   }
 
   if (!state.waitingFor) {
@@ -843,37 +858,46 @@ async function runScanMode() {
   if (si >= 1 && stoch.k[si] != null && stoch.d[si] != null && stoch.k[si-1] != null && stoch.d[si-1] != null &&
       cci[si] != null && cci[si-1] != null && rsi[si] != null && rsi[si-1] != null && tdi.middle[si] != null && tdi.middle[si-1] != null) {
 
-    // --- PHASE A: Must take the very first trade after a fresh H1 EMA 50 cross ---
-    // Rule: Phase A can ONLY trigger if state.waitingFor is active and phaseATaken is false.
-    // We wait for the M5 Stochastic cross in that direction.
-    if (!state.phaseATaken) {
-      const stochCrossBuyPhaseA = (stoch.k[si-1] <= 20 || stoch.d[si-1] <= 20) && 
-                                  (stoch.k[si] > 20 && stoch.d[si] > 20) && 
-                                  (stoch.k[si-1] <= stoch.d[si-1]) && 
-                                  (stoch.k[si] > stoch.d[si]);
+    // Edit 4 — Phase A: replace the h1FreshBuy/h1FreshSell gate with the deadline gate
+    // --- PHASE A: Must take the very first trade within PHASE_A_WINDOW_SECONDS of the fresh H1 EMA 50 cross ---
+    if (!state.phaseATaken && !state.phaseAWindowExpired) {
 
-      const stochCrossSellPhaseA = (stoch.k[si-1] >= 80 || stoch.d[si-1] >= 80) && 
-                                   (stoch.k[si] < 80 && stoch.d[si] < 80) && 
-                                   (stoch.k[si-1] >= stoch.d[si-1]) && 
-                                   (stoch.k[si] < stoch.d[si]);
+      const deadlinePassed = state.phaseADeadlineEpoch && currentCandleEpoch > state.phaseADeadlineEpoch;
 
-      if (state.waitingFor === "BUY" && stochCrossBuyPhaseA) {
-        signalTriggered = true;
-        direction = "BUY";
-        entry = closes[i];
-        entryType = 'PHASE_A';
-        state.phaseATaken = true; // Mark Phase A as taken!
-      } else if (state.waitingFor === "SELL" && stochCrossSellPhaseA) {
-        signalTriggered = true;
-        direction = "SELL";
-        entry = closes[i];
-        entryType = 'PHASE_A';
-        state.phaseATaken = true; // Mark Phase A as taken!
+      if (deadlinePassed) {
+        // Phase A window has closed with no confirmed M5 fill — hand off to Phase B for the rest of this cycle.
+        state.phaseAWindowExpired = true;
+        dbg(`Phase A window EXPIRED at ${new Date(currentCandleEpoch*1000).toISOString()} (deadline was ${new Date(state.phaseADeadlineEpoch*1000).toISOString()}) — no fill. Falling back to Phase B monitoring.`);
+      } else {
+        const stochCrossBuyPhaseA = (stoch.k[si-1] <= 20 || stoch.d[si-1] <= 20) &&
+                                    (stoch.k[si] > 20 && stoch.d[si] > 20) &&
+                                    (stoch.k[si-1] <= stoch.d[si-1]) &&
+                                    (stoch.k[si] > stoch.d[si]);
+
+        const stochCrossSellPhaseA = (stoch.k[si-1] >= 80 || stoch.d[si-1] >= 80) &&
+                                     (stoch.k[si] < 80 && stoch.d[si] < 80) &&
+                                     (stoch.k[si-1] >= stoch.d[si-1]) &&
+                                     (stoch.k[si] < stoch.d[si]);
+
+        if (state.waitingFor === "BUY" && stochCrossBuyPhaseA) {
+          signalTriggered = true;
+          direction = "BUY";
+          entry = closes[i];
+          entryType = 'PHASE_A';
+          state.phaseATaken = true;
+        } else if (state.waitingFor === "SELL" && stochCrossSellPhaseA) {
+          signalTriggered = true;
+          direction = "SELL";
+          entry = closes[i];
+          entryType = 'PHASE_A';
+          state.phaseATaken = true;
+        }
       }
     }
 
-    // --- PHASE B: Stateful Re-entry Engine (Strict Fresh Crosses, Only AFTER Phase A) ---
-    if (!signalTriggered && state.phaseATaken) {
+    // Edit 5 — Phase B gate: allow it to fire after expiry too
+    // --- PHASE B: Stateful Re-entry Engine (fires after a real Phase A fill, OR after Phase A window expires unfilled) ---
+    if (!signalTriggered && (state.phaseATaken || state.phaseAWindowExpired)) {
       const stochCrossBuyB = (stoch.k[si-1] <= 50 || stoch.d[si-1] <= 50) && (stoch.k[si] > 50 && stoch.d[si] > 50) && (stoch.k[si-1] <= stoch.d[si-1]) && (stoch.k[si] > stoch.d[si]);
       const stochCrossSellB = (stoch.k[si-1] >= 50 || stoch.d[si-1] >= 50) && (stoch.k[si] < 50 && stoch.d[si] < 50) && (stoch.k[si-1] >= stoch.d[si-1]) && (stoch.k[si] < stoch.d[si]);
 
@@ -912,7 +936,8 @@ async function runScanMode() {
           signalTriggered = true;
           direction = "BUY";
           entry = closes[i];
-          entryType = 'PHASE_B';
+          // Edit 6 — Tag the BUY-side Phase B fill
+          entryType = state.phaseATaken ? 'PHASE_B' : 'PHASE_B_NO_PRIOR_A';
           state.phaseBPending = null;
           state.phaseBStochFreshSeen = false;
           state.phaseBCciFreshSeen = false;
@@ -948,7 +973,8 @@ async function runScanMode() {
           signalTriggered = true;
           direction = "SELL";
           entry = closes[i];
-          entryType = 'PHASE_B';
+          // Edit 7 — Tag the SELL-side Phase B fill
+          entryType = state.phaseATaken ? 'PHASE_B' : 'PHASE_B_NO_PRIOR_A';
           state.phaseBPending = null;
           state.phaseBStochFreshSeen = false;
           state.phaseBCciFreshSeen = false;
@@ -976,7 +1002,12 @@ async function runScanMode() {
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const bgaTag = getBGAInfo(entry);
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${entryType} (H1 EMA 50 + Audit Verified)\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
+    // Edit 8 — Telegram message setupLabel update
+    const setupLabel = entryType === 'PHASE_B_NO_PRIOR_A'
+      ? 'PHASE B (Phase A window expired unfilled — fallback re-entry)'
+      : `${entryType} (H1 EMA 50, ${PHASE_A_WINDOW_SECONDS/3600}h Phase A window)`;
+
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${setupLabel}\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
     try {
       const contractId = await executeTrade(direction);
@@ -1034,7 +1065,7 @@ async function runScanMode() {
     return;
   }
   if (MODE === "test") {
-    await sendTelegram(`🧪 Test mode active — ${REPO_LABEL}\nFiring a direct BUY trade via proxy...\nCheck your Deriv account for a MULTUP contract.`);
+    await sendTelegram(`Test mode active — ${REPO_LABEL}\nFiring a direct BUY trade via proxy...\nCheck your Deriv account for a MULTUP contract.`);
     try {
       const cid = await executeTrade("BUY");
       await sendTelegram(`✅ Test trade placed. Contract ID: ${cid}`);
