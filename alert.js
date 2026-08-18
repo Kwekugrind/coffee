@@ -780,15 +780,13 @@ async function runScanMode() {
     const h1ci = h1Candles.length - 2; // Closed H1 candle
     const h1PrevCi = h1ci - 1;         // Previous H1 candle
     const ema50_1h = ema(h1Closes, 50); // <--- Using EMA 50
-    
+
     if (ema50_1h[h1ci] != null && ema50_1h[h1PrevCi] != null) {
       h1FreshBuy = (h1Closes[h1PrevCi] <= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] > ema50_1h[h1ci]);
       h1FreshSell = (h1Closes[h1PrevCi] >= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] < ema50_1h[h1ci]);
 
-      if (ema50_1h[h1ci] != null) {
-        if (h1Closes[h1ci] > ema50_1h[h1ci]) h1TrendDir = "BUY";
-        else if (h1Closes[h1ci] < ema50_1h[h1ci]) h1TrendDir = "SELL";
-      }
+      if (h1Closes[h1ci] > ema50_1h[h1ci]) h1TrendDir = "BUY";
+      else if (h1Closes[h1ci] < ema50_1h[h1ci]) h1TrendDir = "SELL";
     }
   }
 
@@ -801,23 +799,23 @@ async function runScanMode() {
     }
   }
 
-  // Edit 1 — New H1 cycle detection: actually set the deadline
+  // ── STEP 1: New H1 cycle detected — reset everything and open a fresh Phase A window ──
   if (h1NewCycleEpoch && state.h1TrendCycleEpoch !== h1NewCycleEpoch) {
     state.h1TrendCycleEpoch = h1NewCycleEpoch;
     state.waitingFor = h1FreshBuy ? "BUY" : "SELL";
-    state.phaseATaken = false; // NEW H1 cycle means Phase A MUST happen first!
+    state.phaseATaken = false;
     state.phaseAWindowExpired = false;
     state.phaseADeadlineEpoch = h1NewCycleEpoch + PHASE_A_WINDOW_SECONDS;
     state.phaseBPending = null;
     state.phaseBStochFreshSeen = false;
     state.phaseBCciFreshSeen = false;
     state.phaseBTdiFreshSeen = false;
-    dbg(`New H1 trend cycle detected at epoch ${h1NewCycleEpoch} (${state.waitingFor}). Phase A window open until ${new Date(state.phaseADeadlineEpoch*1000).toISOString()}.`);
+    dbg(`STEP 1: New H1 trend cycle detected at epoch ${h1NewCycleEpoch} (${state.waitingFor}). Phase A window open until ${new Date(state.phaseADeadlineEpoch * 1000).toISOString()}.`);
   }
 
-  // Edit 2 — Trend invalidation: reset the new fields too
+  // ── STEP 2: Trend invalidation — if H1 trend flips completely against waitingFor, wipe state ──
   if (h1TrendDir && state.waitingFor && h1TrendDir !== state.waitingFor) {
-    dbg("H1 trend flipped against waitingFor. Resetting state.");
+    dbg("STEP 2: H1 trend flipped against waitingFor. Resetting state.");
     state.waitingFor = null;
     state.phaseATaken = false;
     state.h1TrendCycleEpoch = null;
@@ -829,16 +827,35 @@ async function runScanMode() {
     state.phaseBTdiFreshSeen = false;
   }
 
-  // Edit 3 — Restore a SAFE mid-trend boot fallback
+  // ── STEP 3: Cold-boot adoption — ONLY runs if waitingFor is currently null (no cycle tracked at all) ──
   if (!state.waitingFor && h1TrendDir) {
     state.waitingFor = h1TrendDir;
     state.h1TrendCycleEpoch = currentCandleEpoch;
     state.phaseATaken = false;
     state.phaseAWindowExpired = false;
     state.phaseADeadlineEpoch = currentCandleEpoch + PHASE_A_WINDOW_SECONDS;
-    dbg(`Mid-trend boot: adopting ${h1TrendDir}. Phase A window open until ${new Date(state.phaseADeadlineEpoch*1000).toISOString()}.`);
+    dbg(`STEP 3: Cold-boot adoption — no cycle was tracked. Adopting ${h1TrendDir}. Phase A window open until ${new Date(state.phaseADeadlineEpoch * 1000).toISOString()}.`);
   }
 
+  // ── STEP 4: Legacy migration — ONLY runs if waitingFor IS already set, but is missing a deadline ──
+  if (state.waitingFor && !state.phaseATaken && !state.phaseAWindowExpired && !state.phaseADeadlineEpoch) {
+    const nowEpoch = Math.floor(Date.now() / 1000);
+    if (state.h1TrendCycleEpoch) {
+      const properDeadline = state.h1TrendCycleEpoch + PHASE_A_WINDOW_SECONDS;
+      if (nowEpoch > properDeadline) {
+        state.phaseAWindowExpired = true;
+        dbg(`STEP 4: Legacy migration — original H1 cross was at ${new Date(state.h1TrendCycleEpoch * 1000).toISOString()}, deadline already passed. Marking Phase A EXPIRED — falling back to Phase B.`);
+      } else {
+        state.phaseADeadlineEpoch = properDeadline;
+        dbg(`STEP 4: Legacy migration — restored Phase A deadline from original cycle epoch, open until ${new Date(properDeadline * 1000).toISOString()}.`);
+      }
+    } else {
+      state.phaseAWindowExpired = true;
+      dbg(`STEP 4: Legacy migration — no h1TrendCycleEpoch on record. Marking Phase A EXPIRED — falling back to Phase B.`);
+    }
+  }
+
+  // ── STEP 5: If still no active trend to track, exit early ──
   if (!state.waitingFor) {
     state.lastProcessedEpoch = currentCandleEpoch;
     fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
@@ -858,16 +875,13 @@ async function runScanMode() {
   if (si >= 1 && stoch.k[si] != null && stoch.d[si] != null && stoch.k[si-1] != null && stoch.d[si-1] != null &&
       cci[si] != null && cci[si-1] != null && rsi[si] != null && rsi[si-1] != null && tdi.middle[si] != null && tdi.middle[si-1] != null) {
 
-    // Edit 4 — Phase A: replace the h1FreshBuy/h1FreshSell gate with the deadline gate
     // --- PHASE A: Must take the very first trade within PHASE_A_WINDOW_SECONDS of the fresh H1 EMA 50 cross ---
     if (!state.phaseATaken && !state.phaseAWindowExpired) {
-
       const deadlinePassed = state.phaseADeadlineEpoch && currentCandleEpoch > state.phaseADeadlineEpoch;
 
       if (deadlinePassed) {
-        // Phase A window has closed with no confirmed M5 fill — hand off to Phase B for the rest of this cycle.
         state.phaseAWindowExpired = true;
-        dbg(`Phase A window EXPIRED at ${new Date(currentCandleEpoch*1000).toISOString()} (deadline was ${new Date(state.phaseADeadlineEpoch*1000).toISOString()}) — no fill. Falling back to Phase B monitoring.`);
+        dbg(`Phase A window EXPIRED at ${new Date(currentCandleEpoch*1000).toISOString()} — no fill. Falling back to Phase B monitoring.`);
       } else {
         const stochCrossBuyPhaseA = (stoch.k[si-1] <= 20 || stoch.d[si-1] <= 20) &&
                                     (stoch.k[si] > 20 && stoch.d[si] > 20) &&
@@ -895,7 +909,6 @@ async function runScanMode() {
       }
     }
 
-    // Edit 5 — Phase B gate: allow it to fire after expiry too
     // --- PHASE B: Stateful Re-entry Engine (fires after a real Phase A fill, OR after Phase A window expires unfilled) ---
     if (!signalTriggered && (state.phaseATaken || state.phaseAWindowExpired)) {
       const stochCrossBuyB = (stoch.k[si-1] <= 50 || stoch.d[si-1] <= 50) && (stoch.k[si] > 50 && stoch.d[si] > 50) && (stoch.k[si-1] <= stoch.d[si-1]) && (stoch.k[si] > stoch.d[si]);
@@ -936,7 +949,6 @@ async function runScanMode() {
           signalTriggered = true;
           direction = "BUY";
           entry = closes[i];
-          // Edit 6 — Tag the BUY-side Phase B fill
           entryType = state.phaseATaken ? 'PHASE_B' : 'PHASE_B_NO_PRIOR_A';
           state.phaseBPending = null;
           state.phaseBStochFreshSeen = false;
@@ -973,7 +985,6 @@ async function runScanMode() {
           signalTriggered = true;
           direction = "SELL";
           entry = closes[i];
-          // Edit 7 — Tag the SELL-side Phase B fill
           entryType = state.phaseATaken ? 'PHASE_B' : 'PHASE_B_NO_PRIOR_A';
           state.phaseBPending = null;
           state.phaseBStochFreshSeen = false;
@@ -1002,7 +1013,6 @@ async function runScanMode() {
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const bgaTag = getBGAInfo(entry);
 
-    // Edit 8 — Telegram message setupLabel update
     const setupLabel = entryType === 'PHASE_B_NO_PRIOR_A'
       ? 'PHASE B (Phase A window expired unfilled — fallback re-entry)'
       : `${entryType} (H1 EMA 50, ${PHASE_A_WINDOW_SECONDS/3600}h Phase A window)`;
