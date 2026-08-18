@@ -43,9 +43,7 @@ const MODE = process.env.MODE || "cronjob";
 const TRIGGER_SOURCE = process.env.TRIGGER_SOURCE || "manual";
 
 const M5 = 5 * 60;
-const M15 = 15 * 60;
 const H1 = 60 * 60;
-const H4 = 4 * 60 * 60;
 const D1 = 24 * 60 * 60;
 
 const PHASE_A_WINDOW_SECONDS = 2 * 60 * 60; // Strict 2-hour window for Phase A after H1 fresh cross
@@ -158,17 +156,18 @@ async function executeManualClose(result, reason) {
         }
       }
     }
-    trade.result = result;
+    const finalResult = (typeof serverPnl === 'number') ? (serverPnl >= 0 ? "WIN" : "LOSS") : result;
+    trade.result = finalResult;
     trade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
     fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-    const icon = result === "WIN" ? "✅" : "❌";
+    const icon = finalResult === "WIN" ? "✅" : "❌";
     const contractType = trade.direction === "BUY" ? "MULTUP" : "MULTDOWN";
     const durationMs = new Date(trade.closeTime) - new Date(trade.openTime);
     const slDollars = parseFloat(STAKE_USD.toFixed(2));
     const tpDollars = parseFloat((STAKE_USD * RISK_REWARD).toFixed(2));
     const pnlStr = serverPnl >= 0 ? `+$${serverPnl.toFixed(2)}` : `-$${Math.abs(serverPnl).toFixed(2)}`;
     const tp1Status = trade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
-    await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${trade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${trade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${trade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${trade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${reason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${trade.openTime}\nClosed: ${trade.closeTime}\n` + (trade.contractId ? `Contract: \`${trade.contractId}\`` : ""));
+    await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${finalResult}*\n\nDirection: ${trade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${trade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${trade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${trade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${reason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${trade.openTime}\nClosed: ${trade.closeTime}\n` + (trade.contractId ? `Contract: \`${trade.contractId}\`` : ""));
   }
 }
 
@@ -223,7 +222,7 @@ async function withRetry(fn, retries = 3, delay = 4000) {
   }
 }
 
-// CONSOLIDATED DATA FETCHER (Opens ONE single WebSocket connection instead of separate ones - 250 H1 candles for stable EMA 50)
+// CONSOLIDATED DATA FETCHER (M5, H1, D1 - 250 H1 candles for fully converged EMA 50)
 async function fetchAllData() {
   return withRetry(async () => {
     return new Promise((resolve, reject) => {
@@ -232,18 +231,14 @@ async function fetchAllData() {
       ws.on("open", () => {
         ws.send(JSON.stringify({ req_id: 1, ticks_history: SYMBOL, granularity: M5, count: 120, end: "latest", style: "candles" }));
         ws.send(JSON.stringify({ req_id: 2, ticks_history: SYMBOL, granularity: H1, count: 250, end: "latest", style: "candles" }));
-        ws.send(JSON.stringify({ req_id: 3, ticks_history: SYMBOL, granularity: M15, count: 100, end: "latest", style: "candles" }));
-        ws.send(JSON.stringify({ req_id: 4, ticks_history: SYMBOL, granularity: H4, count: 10, end: "latest", style: "candles" }));
         ws.send(JSON.stringify({ req_id: 5, ticks_history: SYMBOL, granularity: D1, count: 5, end: "latest", style: "candles" }));
       });
       ws.on("message", d => {
         const msg = JSON.parse(d);
         if (msg.req_id === 1) results.m5 = msg.candles;
         if (msg.req_id === 2) results.h1 = msg.candles;
-        if (msg.req_id === 3) results.m15 = msg.candles;
-        if (msg.req_id === 4) results.h4 = msg.candles;
         if (msg.req_id === 5) results.d1 = msg.candles;
-        if (results.m5 && results.h1 && results.m15 && results.h4 && results.d1) {
+        if (results.m5 && results.h1 && results.d1) {
           ws.close();
           resolve(results);
         }
@@ -402,14 +397,26 @@ function ema(data, period) {
   return result;
 }
 
-function calculateATR(candles, period) {
+// Wilder's Exponential Smoothing ATR(14)
+function calculateATR(candles, period = 14) {
+  if (!candles || candles.length === 0) return 0;
   const trs = candles.map((c, i) => {
     if (i === 0) return parseFloat(c.high) - parseFloat(c.low);
     const ph = parseFloat(candles[i-1].close);
-    return Math.max(parseFloat(c.high) - parseFloat(c.low), Math.abs(parseFloat(c.high) - ph), Math.abs(parseFloat(c.low) - ph));
+    return Math.max(
+      parseFloat(c.high) - parseFloat(c.low),
+      Math.abs(parseFloat(c.high) - ph),
+      Math.abs(parseFloat(c.low) - ph)
+    );
   });
-  const atrs = sma(trs, period);
-  return atrs[atrs.length - 1] || (trs.reduce((a,b)=>a+b,0)/trs.length);
+  if (trs.length <= period) {
+    return trs.reduce((a, b) => a + b, 0) / trs.length;
+  }
+  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < trs.length; i++) {
+    atr = (atr * (period - 1) + trs[i]) / period;
+  }
+  return atr;
 }
 
 function calcUnrealizedPnL(trade, currentPrice) {
@@ -573,13 +580,19 @@ function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
     const tp1 = validTp1 || (baseWhole + step);
 
     let futureLevels = allLevels.filter(l => l > tp1).sort((a, b) => a - b);
-    if (fibMaxLimit) futureLevels = futureLevels.filter(l => l <= fibMaxLimit);
+    if (fibMaxLimit && fibMaxLimit > tp1) futureLevels = futureLevels.filter(l => l <= fibMaxLimit);
 
-    let tp2 = futureLevels[0] || tp1 + halfStep;
-    let tp3 = futureLevels[1] || tp1 + step;
+    let tp2 = futureLevels[0] || (tp1 + halfStep);
+    let tp3 = futureLevels[1] || (tp1 + step);
 
     if (tp2 <= tp1) tp2 = tp1 + halfStep;
     if (tp3 <= tp2) tp3 = tp2 + halfStep;
+
+    // Apply Fib clamp LAST so sanity pass cannot overwrite it
+    if (fibMaxLimit && fibMaxLimit > tp1) {
+      tp2 = Math.min(tp2, fibMaxLimit);
+      tp3 = Math.min(tp3, fibMaxLimit);
+    }
 
     return { tp1, tp2, tp3 };
   } else {
@@ -595,36 +608,22 @@ function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
     const tp1 = validTp1 || (baseWhole - step);
 
     let futureLevels = allLevels.filter(l => l < tp1).sort((a, b) => b - a);
-    if (fibMaxLimit) futureLevels = futureLevels.filter(l => l >= fibMaxLimit);
+    if (fibMaxLimit && fibMaxLimit < tp1) futureLevels = futureLevels.filter(l => l >= fibMaxLimit);
 
-    let tp2 = futureLevels[0] || tp1 - halfStep;
-    let tp3 = futureLevels[1] || tp1 - step;
+    let tp2 = futureLevels[0] || (tp1 - halfStep);
+    let tp3 = futureLevels[1] || (tp1 - step);
 
     if (tp2 >= tp1) tp2 = tp1 - halfStep;
     if (tp3 >= tp2) tp3 = tp2 - halfStep;
 
+    // Apply Fib clamp LAST so sanity pass cannot overwrite it
+    if (fibMaxLimit && fibMaxLimit < tp1) {
+      tp2 = Math.max(tp2, fibMaxLimit);
+      tp3 = Math.max(tp3, fibMaxLimit);
+    }
+
     return { tp1, tp2, tp3 };
   }
-}
-
-async function getD1Context() {
-  try {
-    const candles = await fetchCandles(D1, 5);
-    if (!candles || candles.length < 2) return null;
-    const c = candles[candles.length - 2];
-    const open = parseFloat(c.open), close = parseFloat(c.close);
-    const change = close - open, changePct = (change / open) * 100;
-    return { direction: close > open ? "🟢 BULLISH" : "🔴 BEARISH", open, close, change, changePct, candles };
-  } catch (e) { console.error("getD1Context error:", e.message); return null; }
-}
-
-function checkAlignment(signalDir, d1Dir) {
-  const bull = d1Dir.includes("BULLISH"), bear = d1Dir.includes("BEARISH");
-  if (signalDir === "BUY" && bull) return "✅ D1 confirms BUY";
-  if (signalDir === "SELL" && bear) return "✅ D1 confirms SELL";
-  if (signalDir === "BUY" && bear) return "⚠️ Counter-trend BUY (D1 bearish)";
-  if (signalDir === "SELL" && bull) return "⚠️ Counter-trend SELL (D1 bullish)";
-  return "❓ Unknown";
 }
 
 // ==================== MAIN SCANNER & TRADE LOGIC ====================
@@ -643,8 +642,6 @@ async function runScanMode() {
     dbg(`Open trade PnL: ${pnl.toFixed(4)}`);
 
     const closeWith = async (result, exitReason) => {
-      openTrade.result = result;
-      openTrade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
       let serverPnl = pnl;
       if (openTrade.contractId) {
         try {
@@ -673,8 +670,13 @@ async function runScanMode() {
         }
       }
 
+      // Derive final result strictly from serverPnl to maintain true P&L integrity
+      const finalResult = (typeof serverPnl === 'number') ? (serverPnl >= 0 ? "WIN" : "LOSS") : result;
+      openTrade.result = finalResult;
+      openTrade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
+
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-      const icon = result === "WIN" ? "✅" : "❌";
+      const icon = finalResult === "WIN" ? "✅" : "❌";
       const contractType = openTrade.direction === "BUY" ? "MULTUP" : "MULTDOWN";
       const durationMs = new Date(openTrade.closeTime) - new Date(openTrade.openTime);
       const slDollars = parseFloat(STAKE_USD.toFixed(2));
@@ -682,17 +684,30 @@ async function runScanMode() {
       const tp1Status = openTrade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
       const pnlStr = serverPnl >= 0 ? `+$${serverPnl.toFixed(2)}` : `-$${Math.abs(serverPnl).toFixed(2)}`;
       
-      await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${result}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
+      await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${finalResult}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
     };
 
-    // BREAKEVEN PROTECTION: Arm once profit hits $2.00
+    // ── 1. Hard SL Price Check (Highest Priority per Spec) ──
+    const slBreached = openTrade.direction === "BUY" ? currentPrice <= openTrade.sl : currentPrice >= openTrade.sl;
+    if (slBreached) {
+      await closeWith("LOSS", `Hard SL hit — price ${currentPrice.toFixed(4)} breached SL ${openTrade.sl.toFixed(4)}`);
+      return;
+    }
+
+    // ── 2. TP2 Ultimate Target Hit ──
+    const tp2Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp2 : currentPrice <= openTrade.tp2;
+    if (tp2Hit) {
+      await closeWith("WIN", `TP2 Ultimate Target hit — price ${currentPrice.toFixed(4)} reached BGA level ${openTrade.tp2.toFixed(4)}`);
+      return;
+    }
+
+    // ── 3. Breakeven Protection & Commission-Covered Pullback Exit ──
     if (!openTrade.tp1Reached && !openTrade.breakevenSet && pnl >= BREAKEVEN_ACTIVATE_USD) {
       openTrade.breakevenSet = true;
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       await sendTelegram(`⚖️ *${REPO_LABEL} — Breakeven Armed*\nProfit reached $${BREAKEVEN_ACTIVATE_USD.toFixed(2)}. Price floor locked at entry (${openTrade.entry.toFixed(4)}).`);
     }
 
-    // COMMISSION-COVERED BREAKEVEN TRIGGER: Close early on pullback to lock in +$0.50 net profit
     const targetNetProfit = 0.50;
     const requiredRawPnl = targetNetProfit + COMMISSION_USD;
     const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
@@ -709,21 +724,7 @@ async function runScanMode() {
       return;
     }
 
-    // 1. Hard SL Price Check
-    const slBreached = openTrade.direction === "BUY" ? currentPrice <= openTrade.sl : currentPrice >= openTrade.sl;
-    if (slBreached) {
-      await closeWith("LOSS", `Hard SL hit — price ${currentPrice.toFixed(4)} breached SL ${openTrade.sl.toFixed(4)}`);
-      return;
-    }
-
-    // 2. TP2 Ultimate Target Hit
-    const tp2Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp2 : currentPrice <= openTrade.tp2;
-    if (tp2Hit) {
-      await closeWith("WIN", `TP2 Ultimate Target hit — price ${currentPrice.toFixed(4)} reached BGA level ${openTrade.tp2.toFixed(4)}`);
-      return;
-    }
-
-    // 3. TP1 Price Level Hit (First BGA Whole Number) -> Arms 50% Peak-Drop Trailing
+    // ── 4. TP1 Price Level Hit & High-Water Mark Trailing (50% Trail) ──
     if (!openTrade.tp1Reached) {
       const tp1Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1;
       if (tp1Hit) {
@@ -733,7 +734,6 @@ async function runScanMode() {
       }
     }
 
-    // 4. High-Water Mark Trailing (Activated at TP1 BGA Whole Number, exits if profit drops 50% from peak)
     if (openTrade.tp1Reached) {
       if (openTrade.peakProfit === null || pnl > openTrade.peakProfit) {
         openTrade.peakProfit = pnl;
@@ -751,7 +751,7 @@ async function runScanMode() {
     return;
   }
 
-  // ── Signal Scan (Consolidated Data Fetching - ONE Single WebSocket Handshake) ──
+  // ── Signal Scan (Consolidated Data Fetching - M5, H1, D1) ──
   const scanData = await fetchAllData();
   const candles = scanData.m5;
   const h1Candles = scanData.h1;
@@ -771,15 +771,15 @@ async function runScanMode() {
   const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
   const atr14 = calculateATR(candles, ATR_PERIOD);
 
-  // 1. Evaluate Fresh H1 Crossover using EXPONENTIAL MOVING AVERAGE (EMA 50) over 250 H1 candles
+  // 1. Evaluate Fresh H1 Crossover using EXPONENTIAL MOVING AVERAGE (EMA 50) over at least 250 H1 candles
   let h1FreshBuy = false;
   let h1FreshSell = false;
   let h1TrendDir = null;
-  if (h1Candles && h1Candles.length >= 52) {
+  if (h1Candles && h1Candles.length >= 250) {
     const h1Closes = h1Candles.map(c => parseFloat(c.close));
     const h1ci = h1Candles.length - 2; // Closed H1 candle
     const h1PrevCi = h1ci - 1;         // Previous H1 candle
-    const ema50_1h = ema(h1Closes, 50); // <--- Using EMA 50
+    const ema50_1h = ema(h1Closes, 50); // <--- Fully converged EMA 50
 
     if (ema50_1h[h1ci] != null && ema50_1h[h1PrevCi] != null) {
       h1FreshBuy = (h1Closes[h1PrevCi] <= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] > ema50_1h[h1ci]);
@@ -792,7 +792,7 @@ async function runScanMode() {
 
   // Check if we entered a NEW H1 trend cycle via a fresh crossover event
   let h1NewCycleEpoch = null;
-  if (h1Candles && h1Candles.length >= 52) {
+  if (h1Candles && h1Candles.length >= 250) {
     const h1ci = h1Candles.length - 2;
     if (h1FreshBuy || h1FreshSell) {
       h1NewCycleEpoch = h1Candles[h1ci].epoch;
@@ -883,12 +883,13 @@ async function runScanMode() {
         state.phaseAWindowExpired = true;
         dbg(`Phase A window EXPIRED at ${new Date(currentCandleEpoch*1000).toISOString()} — no fill. Falling back to Phase B monitoring.`);
       } else {
-        const stochCrossBuyPhaseA = (stoch.k[si-1] <= 20 || stoch.d[si-1] <= 20) &&
+        // Strict AND operator for prior candle oversold/overbought per spec
+        const stochCrossBuyPhaseA = (stoch.k[si-1] <= 20 && stoch.d[si-1] <= 20) &&
                                     (stoch.k[si] > 20 && stoch.d[si] > 20) &&
                                     (stoch.k[si-1] <= stoch.d[si-1]) &&
                                     (stoch.k[si] > stoch.d[si]);
 
-        const stochCrossSellPhaseA = (stoch.k[si-1] >= 80 || stoch.d[si-1] >= 80) &&
+        const stochCrossSellPhaseA = (stoch.k[si-1] >= 80 && stoch.d[si-1] >= 80) &&
                                      (stoch.k[si] < 80 && stoch.d[si] < 80) &&
                                      (stoch.k[si-1] >= stoch.d[si-1]) &&
                                      (stoch.k[si] < stoch.d[si]);
@@ -911,8 +912,9 @@ async function runScanMode() {
 
     // --- PHASE B: Stateful Re-entry Engine (fires after a real Phase A fill, OR after Phase A window expires unfilled) ---
     if (!signalTriggered && (state.phaseATaken || state.phaseAWindowExpired)) {
-      const stochCrossBuyB = (stoch.k[si-1] <= 50 || stoch.d[si-1] <= 50) && (stoch.k[si] > 50 && stoch.d[si] > 50) && (stoch.k[si-1] <= stoch.d[si-1]) && (stoch.k[si] > stoch.d[si]);
-      const stochCrossSellB = (stoch.k[si-1] >= 50 || stoch.d[si-1] >= 50) && (stoch.k[si] < 50 && stoch.d[si] < 50) && (stoch.k[si-1] >= stoch.d[si-1]) && (stoch.k[si] < stoch.d[si]);
+      // 50-level cross on Stochastic main line (%K)
+      const stochCrossBuyB = (stoch.k[si-1] <= 50) && (stoch.k[si] > 50);
+      const stochCrossSellB = (stoch.k[si-1] >= 50) && (stoch.k[si] < 50);
 
       const cciCrossBuyB = cci[si-1] <= 0 && cci[si] > 0;
       const cciCrossSellB = cci[si-1] >= 0 && cci[si] < 0;
