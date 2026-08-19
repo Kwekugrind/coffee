@@ -30,6 +30,7 @@ const STAKE_USD = 5;
 const RISK_REWARD = 1.5;
 const SAFETY_TP_USD = 10.00; // $10 flat profit insurance ceiling on broker side
 const BREAKEVEN_ACTIVATE_USD = 2.00; // Move SL to entry once profit hits $2.00
+const CATASTROPHIC_PNL_FLOOR = -5.50; // Server-truth catastrophic loss floor (cushion beyond -$5 hard SL for financing/slippage)
 const PSAR_STEP = 0.010; // Parabolic SAR acceleration factor step
 const PSAR_MAX = 0.070;  // Parabolic SAR maximum acceleration factor
 const MARKET_DATA_APP_ID = "1089"; // Dedicated public App ID for unauthenticated candle data
@@ -131,6 +132,7 @@ async function executeManualClose(result, reason) {
   for (const trade of open) {
     const currentPrice = await getCurrentPrice(trade.symbol);
     let serverPnl = calcUnrealizedPnL(trade, currentPrice);
+    let resultSource = "manual_command";
     if (trade.contractId) {
       try {
         const closeRes = await closeContract(trade.contractId);
@@ -139,6 +141,7 @@ async function executeManualClose(result, reason) {
           const errDesc = closeRes.error?.message || JSON.stringify(closeRes.error);
           if (errCode === "ContractNotFound" || errDesc.includes("not found among your open positions")) {
             serverPnl = -5.00;
+            resultSource = "estimated_fallback";
           } else {
             await sendTelegram(`⚠️ *${REPO_LABEL}* — Manual Close Warning\n\nFailed to close contract \`${trade.contractId}\` on Deriv: ${errDesc}. Retrying next scan.`);
             continue;
@@ -146,10 +149,12 @@ async function executeManualClose(result, reason) {
         }
         if (typeof closeRes.sell?.profit === 'number') {
           serverPnl = closeRes.sell.profit;
+          resultSource = "manual_command";
         }
       } catch (e) {
         if (e.message.includes("ContractNotFound") || e.message.includes("not found among your open positions")) {
           serverPnl = -5.00; // Proceed with local close
+          resultSource = "estimated_fallback";
         } else {
           console.error("Close error:", e.message);
           continue;
@@ -158,6 +163,7 @@ async function executeManualClose(result, reason) {
     }
     const finalResult = (typeof serverPnl === 'number') ? (serverPnl >= 0 ? "WIN" : "LOSS") : result;
     trade.result = finalResult;
+    trade.resultSource = resultSource;
     trade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
     fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
     const icon = finalResult === "WIN" ? "✅" : "❌";
@@ -301,7 +307,7 @@ async function getDerivOTP(accountId) {
   return json.data.url;
 }
 
-// ── Authenticated Server Contract Status (Ground Truth PnL) ──
+// ── Authenticated Server Contract Status (Clean return without synthetic is_sold) ──
 async function getServerContractStatus(contractId) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -320,7 +326,7 @@ async function getServerContractStatus(contractId) {
     dbg("Server contract status response:", JSON.stringify(data));
     const errCode = data.error?.code || data.errors?.code;
     if (errCode === "ContractNotFound") {
-      return { error: "ContractNotFound", is_sold: 1 };
+      return { error: "ContractNotFound" }; // Clean error marker without synthetic is_sold: 1
     }
     if (data.error || data.errors) {
       throw new Error(`getServerContractStatus error: ${JSON.stringify(data.error || data.errors)}`);
@@ -340,7 +346,7 @@ async function getServerContractStatus(contractId) {
   }, 3, 3000);
 }
 
-// ── Authenticated Portfolio Fetcher (Startup Crash/Timeout Recovery) ──
+// ── Authenticated Portfolio Fetcher (Active Contracts Verification) ──
 async function getOpenPortfolio() {
   if (!DERIV_TOKEN || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -361,6 +367,44 @@ async function getOpenPortfolio() {
       throw new Error(`getOpenPortfolio error: ${JSON.stringify(data.error || data.errors)}`);
     }
     return data.portfolio?.contracts || [];
+  }, 3, 3000);
+}
+
+// ── Authenticated Profit Table Lookup (Recovers true PnL for orphaned/settled contracts) ──
+async function getContractProfitFromHistory(contractId, approxOpenEpoch) {
+  if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
+  return withRetry(async () => {
+    const accountId = await getDerivAccountId();
+    const wsUrl = await getDerivOTP(accountId);
+    const response = await fetch(PROXY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
+      body: JSON.stringify({
+        wsUrl,
+        action: "profit_table",
+        params: {
+          profit_table: 1,
+          description: 1,
+          limit: 25,
+          sort: "DESC",
+          date_from: approxOpenEpoch ? approxOpenEpoch - 300 : undefined
+        }
+      })
+    });
+    const data = await response.json();
+    dbg("Profit table response:", JSON.stringify(data));
+    if (data.error || data.errors) {
+      throw new Error(`getContractProfitFromHistory error: ${JSON.stringify(data.error || data.errors)}`);
+    }
+    const transactions = data.profit_table?.transactions || [];
+    const match = transactions.find(tx => String(tx.contract_id) === String(contractId));
+    if (!match) return null;
+
+    const profit = typeof match.profit === 'number'
+      ? match.profit
+      : (parseFloat(match.sell_price) - parseFloat(match.buy_price));
+
+    return { profit, sellTime: match.sell_time };
   }, 3, 3000);
 }
 
@@ -786,13 +830,71 @@ async function runScanMode() {
       
       // Default local PnL estimate
       let pnl = calcUnrealizedPnL(openTrade, currentPrice);
+      let usingServerTruthPnl = false;
 
       // PART A: Fetch authoritative server-truth PnL from Deriv proposal_open_contract
       if (openTrade.contractId) {
         try {
           const serverStatus = await getServerContractStatus(openTrade.contractId);
+
+          // 1. ContractNotFound: Cross-check active portfolio to avoid false retirement from indexing lag
+          if (serverStatus && serverStatus.error === "ContractNotFound") {
+            dbg(`ContractNotFound for ${openTrade.contractId}. Cross-checking active portfolio...`);
+            const activeContracts = await getOpenPortfolio();
+            const stillActive = activeContracts?.some(c => String(c.contract_id) === String(openTrade.contractId));
+
+            if (stillActive) {
+              console.warn(`[${REPO_LABEL}] Contract ${openTrade.contractId} returned ContractNotFound but is present in active portfolio. Keeping position open.`);
+            } else {
+              console.warn(`[${REPO_LABEL}] Contract ${openTrade.contractId} confirmed absent from portfolio. Attempting profit_table recovery...`);
+
+              let recovered = null;
+              try {
+                const openEpoch = openTrade.openTime ? Math.floor(new Date(openTrade.openTime).getTime() / 1000) : undefined;
+                recovered = await getContractProfitFromHistory(openTrade.contractId, openEpoch);
+              } catch (histErr) {
+                console.warn(`[${REPO_LABEL}] profit_table lookup failed: ${histErr.message}`);
+              }
+
+              if (recovered && typeof recovered.profit === 'number') {
+                openTrade.result = recovered.profit >= 0 ? "WIN" : "LOSS";
+                openTrade.resultSource = "server_history_verified";
+                openTrade.closeTime = openTrade.closeTime || (recovered.sellTime
+                  ? new Date(recovered.sellTime * 1000).toISOString().replace("T", " ").substring(0, 19)
+                  : new Date().toISOString().replace("T", " ").substring(0, 19));
+                console.log(`[${REPO_LABEL}] Recovered true realized PnL from profit_table: $${recovered.profit.toFixed(2)}. Retiring accurately.`);
+                fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+                return;
+              }
+
+              // Real lookup failed/pending — retry across up to 3 scans
+              openTrade.orphanRetryCount = (openTrade.orphanRetryCount || 0) + 1;
+              if (openTrade.orphanRetryCount < 3) {
+                console.warn(`[${REPO_LABEL}] profit_table had no match yet (attempt ${openTrade.orphanRetryCount}/3). Will retry next scan.`);
+                fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+                return;
+              }
+
+              console.warn(`[${REPO_LABEL}] Contract ${openTrade.contractId} unrecoverable after 3 attempts. Defaulting to LOSS as last resort — THIS IS AN ESTIMATE, NOT VERIFIED.`);
+              openTrade.result = openTrade.result || "LOSS";
+              openTrade.resultSource = "estimated_fallback";
+              openTrade.closeTime = openTrade.closeTime || new Date().toISOString().replace("T", " ").substring(0, 19);
+              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+              return; // Retired cleanly
+            }
+          } else if (serverStatus && serverStatus.is_sold === 1) {
+            // 2. Genuine sold contract confirmed on Deriv with real PnL
+            console.log(`[${REPO_LABEL}] Contract ${openTrade.contractId} confirmed SOLD on Deriv (Realized PnL: $${serverStatus.profit}). Syncing local record.`);
+            openTrade.result = (typeof serverStatus.profit === 'number' && serverStatus.profit >= 0) ? "WIN" : "LOSS";
+            openTrade.resultSource = "server_sold";
+            openTrade.closeTime = openTrade.closeTime || new Date().toISOString().replace("T", " ").substring(0, 19);
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+            return; // Retired cleanly — stop managing
+          }
+
           if (serverStatus && typeof serverStatus.profit === 'number') {
             pnl = serverStatus.profit;
+            usingServerTruthPnl = true;
             dbg(`Server-truth PnL for contract ${openTrade.contractId}: $${pnl.toFixed(2)}`);
           } else {
             console.warn(`[${REPO_LABEL}] Warning: Failed to retrieve server-truth PnL for contract ${openTrade.contractId}. Falling back to local estimate: $${pnl.toFixed(4)}`);
@@ -835,6 +937,7 @@ async function runScanMode() {
 
       const closeWith = async (result, exitReason) => {
         let serverPnl = pnl;
+        let resultSource = "estimated_fallback";
         if (openTrade.contractId) {
           try {
             const closeRes = await closeContract(openTrade.contractId);
@@ -843,6 +946,7 @@ async function runScanMode() {
               const errDesc = closeRes.error?.message || JSON.stringify(closeRes.error);
               if (errCode === "ContractNotFound" || errDesc.includes("not found among your open positions")) {
                 serverPnl = -5.00;
+                resultSource = "estimated_fallback";
               } else {
                 console.error(`⚠️ Failed to close contract on Deriv: ${errDesc}`);
                 await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Warning\n\nFailed to close contract \`${openTrade.contractId}\` on Deriv: ${errDesc}. Retrying next scan.`);
@@ -850,10 +954,12 @@ async function runScanMode() {
               }
             } else if (typeof closeRes.sell?.profit === 'number') {
               serverPnl = closeRes.sell.profit;
+              resultSource = "server_close_confirmed";
             }
           } catch (e) {
             if (e.message.includes("ContractNotFound") || e.message.includes("not found among your open positions")) {
               serverPnl = -5.00; // Proceed with local close
+              resultSource = "estimated_fallback";
             } else {
               console.error("Close exception:", e.message);
               await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Error\n\nException closing contract \`${openTrade.contractId}\`: ${e.message}. Retrying next scan.`);
@@ -865,6 +971,7 @@ async function runScanMode() {
         // Derive final result strictly from serverPnl to maintain true P&L integrity
         const finalResult = (typeof serverPnl === 'number') ? (serverPnl >= 0 ? "WIN" : "LOSS") : result;
         openTrade.result = finalResult;
+        openTrade.resultSource = resultSource;
         openTrade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
 
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
@@ -886,6 +993,12 @@ async function runScanMode() {
         return;
       }
 
+      // ── 1b. Server-Truth Catastrophic Backstop (Catches financing/spread drag invisible to price SL) ──
+      if (usingServerTruthPnl && pnl <= CATASTROPHIC_PNL_FLOOR) {
+        await closeWith("LOSS", `Server-truth catastrophic stop — realized pnl $${pnl.toFixed(2)} breached floor $${CATASTROPHIC_PNL_FLOOR.toFixed(2)} (financing/spread drag protection)`);
+        return;
+      }
+
       // ── 2. TP2 Ultimate Target Hit ──
       const tp2Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp2 : currentPrice <= openTrade.tp2;
       if (tp2Hit) {
@@ -901,7 +1014,7 @@ async function runScanMode() {
       }
 
       const targetNetProfit = 0.70; // Server-truth profit lock floor ($0.70 net)
-      const breakevenHit = openTrade.breakevenSet && pnl <= targetNetProfit;
+      const breakevenHit = openTrade.breakevenSet && pnl > 0 && pnl <= targetNetProfit;
       if (breakevenHit) {
         await closeWith("WIN", `Commission-Covered Breakeven exit — locked +$${pnl.toFixed(2)} net profit (target $${targetNetProfit.toFixed(2)})`);
         return;
