@@ -97,7 +97,7 @@ async function runSummary(label) {
   const closed = trades.filter(t => t.result);
   const wins = closed.filter(t => t.result === "WIN").length;
   const losses = closed.filter(t => t.result === "LOSS").length;
-  const openTrades = trades.filter(t => !t.result);
+  const openTrades = trades.filter(t => !t.result && !t.pending);
   let msg = `📊 *${label} Summary — ${REPO_LABEL}*\n\nTotal closed: ${closed.length}\n✅ Wins: ${wins} | ❌ Losses: ${losses}\nWin rate: ${closed.length ? ((wins/closed.length)*100).toFixed(1) : 0}%\nOpen positions: ${openTrades.length}`;
   if (openTrades.length) msg += "\n\n*Open trades:*\n" + openTrades.map(t => `• ${t.direction} @ ${t.entry} (${t.openTime})`).join("\n");
   await sendTelegram(msg);
@@ -114,7 +114,7 @@ async function checkTelegramCommands() {
       const text = update.message?.text?.trim()?.toLowerCase();
       if (text === "/status") {
         const trades = fs.existsSync("trades.json") ? JSON.parse(fs.readFileSync("trades.json")) : [];
-        const open = trades.filter(t => !t.result);
+        const open = trades.filter(t => !t.result && !t.pending);
         await sendTelegram(open.length ? `📍 Open trades:\n${open.map(t=>`• ${t.direction} @ ${t.entry}`).join("\n")}` : "No open trades.");
       }
       if (text === "/close win" || text === "/closewin") { await executeManualClose("WIN", "telegram command"); }
@@ -126,7 +126,7 @@ async function checkTelegramCommands() {
 
 async function executeManualClose(result, reason) {
   const trades = fs.existsSync("trades.json") ? JSON.parse(fs.readFileSync("trades.json")) : [];
-  const open = trades.filter(t => !t.result);
+  const open = trades.filter(t => !t.result && !t.pending);
   if (!open.length) { await sendTelegram(`⚠️ *${REPO_LABEL}*\n\nNo open trade found to close.`); return; }
   for (const trade of open) {
     const currentPrice = await getCurrentPrice(trade.symbol);
@@ -298,8 +298,70 @@ async function getDerivOTP(accountId) {
   });
   const json = await res.json();
   if (!res.ok) throw new Error(`getOTP failed: ${JSON.stringify(json.errors || json)}`);
-  console.log(` OTP WebSocket URL obtained ✅`);
   return json.data.url;
+}
+
+// ── Authenticated Server Contract Status (Ground Truth PnL) ──
+async function getServerContractStatus(contractId) {
+  if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
+  return withRetry(async () => {
+    const accountId = await getDerivAccountId();
+    const wsUrl = await getDerivOTP(accountId);
+    const response = await fetch(PROXY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
+      body: JSON.stringify({
+        wsUrl,
+        action: "proposal_open_contract",
+        params: { proposal_open_contract: 1, contract_id: contractId }
+      })
+    });
+    const data = await response.json();
+    dbg("Server contract status response:", JSON.stringify(data));
+    const errCode = data.error?.code || data.errors?.code;
+    if (errCode === "ContractNotFound") {
+      return { error: "ContractNotFound", is_sold: 1 };
+    }
+    if (data.error || data.errors) {
+      throw new Error(`getServerContractStatus error: ${JSON.stringify(data.error || data.errors)}`);
+    }
+    const poc = data.proposal_open_contract;
+    if (poc) {
+      return {
+        profit: poc.profit,
+        bid_price: poc.bid_price,
+        current_spot: poc.current_spot,
+        is_sold: poc.is_sold,
+        is_expired: poc.is_expired,
+        status: poc.status
+      };
+    }
+    return null;
+  }, 3, 3000);
+}
+
+// ── Authenticated Portfolio Fetcher (Startup Crash/Timeout Recovery) ──
+async function getOpenPortfolio() {
+  if (!DERIV_TOKEN || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
+  return withRetry(async () => {
+    const accountId = await getDerivAccountId();
+    const wsUrl = await getDerivOTP(accountId);
+    const response = await fetch(PROXY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
+      body: JSON.stringify({
+        wsUrl,
+        action: "portfolio",
+        params: { portfolio: 1 }
+      })
+    });
+    const data = await response.json();
+    dbg("Portfolio response:", JSON.stringify(data));
+    if (data.error || data.errors) {
+      throw new Error(`getOpenPortfolio error: ${JSON.stringify(data.error || data.errors)}`);
+    }
+    return data.portfolio?.contracts || [];
+  }, 3, 3000);
 }
 
 // ── Resilient Trade Execution with withRetry ──
@@ -661,481 +723,574 @@ function calculateBgaTakeProfits(entry, direction, slDistance, d1Candles) {
 
 // ==================== MAIN SCANNER & TRADE LOGIC ====================
 async function runScanMode() {
-  console.log(`[${REPO_LABEL}] Scan started — ${new Date().toISOString()}`);
-  await checkTelegramCommands();
-  let trades = [];
-  try { trades = JSON.parse(fs.readFileSync("trades.json")); } catch {}
+  const LOCK_FILE = "scan.lock";
+  const LOCK_MAX_AGE_MS = 4 * 60 * 1000; // 4 minutes
 
-  // ── Open Position Management ──────────────────────────────────────────
-  const openTrade = trades.find(t => !t.result);
-  if (openTrade) {
-    const tradeData = await fetchOpenTradeData();
-    const currentPrice = tradeData.price;
-    const pnl = calcUnrealizedPnL(openTrade, currentPrice);
-    dbg(`Open trade PnL: ${pnl.toFixed(4)}`);
+  // ── Concurrency Overlap Protection ──
+  if (fs.existsSync(LOCK_FILE)) {
+    try {
+      const lockTime = parseInt(fs.readFileSync(LOCK_FILE, "utf-8"), 10);
+      if (Date.now() - lockTime < LOCK_MAX_AGE_MS) {
+        console.log(`[${REPO_LABEL}] Scan lock active (running since ${new Date(lockTime).toISOString()}). Aborting run to prevent overlap.`);
+        return;
+      } else {
+        console.warn(`[${REPO_LABEL}] Stale scan lock detected. Overwriting.`);
+      }
+    } catch {
+      console.warn(`[${REPO_LABEL}] Error reading scan lock. Overwriting.`);
+    }
+  }
+  fs.writeFileSync(LOCK_FILE, String(Date.now()));
 
-    // ── Dynamic Live-Trailing Parabolic SAR Stop Loss ──
-    if (tradeData.candles && tradeData.candles.length >= 2) {
-      const psarValues = calculatePSAR(tradeData.candles, PSAR_STEP, PSAR_MAX);
-      const livePsar = psarValues[psarValues.length - 2]; // Closed M5 candle (no repainting)
-      const currentClose = parseFloat(tradeData.candles[tradeData.candles.length - 2].close);
+  try {
+    console.log(`[${REPO_LABEL}] Scan started — ${new Date().toISOString()}`);
+    let trades = [];
+    try { trades = JSON.parse(fs.readFileSync("trades.json")); } catch {}
 
-      if (livePsar != null) {
-        if (!openTrade.psarAligned) {
-          const nowAligned = openTrade.direction === "BUY" ? livePsar < currentClose : livePsar > currentClose;
-          if (nowAligned) {
-            openTrade.psarAligned = true;
+    // ── STEP 0: Reconcile pending in-flight trade attempts FIRST (crash/timeout recovery) ──
+    const pendingTradeIdx = trades.findIndex(t => !t.result && t.pending);
+    if (pendingTradeIdx !== -1) {
+      const pendingTrade = trades[pendingTradeIdx];
+      console.log(`[${REPO_LABEL}] Pending unconfirmed trade attempt found (${pendingTrade.id}). Reconciling with Deriv portfolio...`);
+      try {
+        const openContracts = await getOpenPortfolio();
+        const expectedType = pendingTrade.direction === "BUY" ? "MULTUP" : "MULTDOWN";
+        const matchingContract = openContracts?.find(c => 
+          c.symbol === TRADING_SYMBOL && 
+          c.contract_type === expectedType
+        );
+
+        if (matchingContract && matchingContract.contract_id) {
+          console.log(`[${REPO_LABEL}] Found matching active contract ${matchingContract.contract_id} on Deriv. Adopting position.`);
+          pendingTrade.contractId = matchingContract.contract_id;
+          pendingTrade.pending = false;
+          fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+          await sendTelegram(`🔄 *${REPO_LABEL}* — Reconciled in-flight position on Deriv (Contract \`${matchingContract.contract_id}\`). Adopted into active tracking.`);
+        } else {
+          console.log(`[${REPO_LABEL}] No matching contract found on Deriv portfolio. Clearing aborted attempt.`);
+          trades.splice(pendingTradeIdx, 1);
+          fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+        }
+      } catch (reconErr) {
+        console.error(`[${REPO_LABEL}] Error reconciling portfolio:`, reconErr.message);
+      }
+    }
+
+    await checkTelegramCommands();
+
+    // ── Open Position Management ──────────────────────────────────────────
+    const openTrade = trades.find(t => !t.result && !t.pending);
+    if (openTrade) {
+      const tradeData = await fetchOpenTradeData();
+      const currentPrice = tradeData.price;
+      
+      // Default local PnL estimate
+      let pnl = calcUnrealizedPnL(openTrade, currentPrice);
+
+      // PART A: Fetch authoritative server-truth PnL from Deriv proposal_open_contract
+      if (openTrade.contractId) {
+        try {
+          const serverStatus = await getServerContractStatus(openTrade.contractId);
+          if (serverStatus && typeof serverStatus.profit === 'number') {
+            pnl = serverStatus.profit;
+            dbg(`Server-truth PnL for contract ${openTrade.contractId}: $${pnl.toFixed(2)}`);
+          } else {
+            console.warn(`[${REPO_LABEL}] Warning: Failed to retrieve server-truth PnL for contract ${openTrade.contractId}. Falling back to local estimate: $${pnl.toFixed(4)}`);
+          }
+        } catch (err) {
+          console.warn(`[${REPO_LABEL}] Warning: Exception fetching server-truth PnL (${err.message}). Falling back to local estimate: $${pnl.toFixed(4)}`);
+        }
+      }
+      dbg(`Open trade PnL: ${pnl.toFixed(4)}`);
+
+      // ── Dynamic Live-Trailing Parabolic SAR Stop Loss ──
+      if (tradeData.candles && tradeData.candles.length >= 2) {
+        const psarValues = calculatePSAR(tradeData.candles, PSAR_STEP, PSAR_MAX);
+        const livePsar = psarValues[psarValues.length - 2]; // Closed M5 candle (no repainting)
+        const currentClose = parseFloat(tradeData.candles[tradeData.candles.length - 2].close);
+
+        if (livePsar != null) {
+          if (!openTrade.psarAligned) {
+            const nowAligned = openTrade.direction === "BUY" ? livePsar < currentClose : livePsar > currentClose;
+            if (nowAligned) {
+              openTrade.psarAligned = true;
+              openTrade.sl = openTrade.direction === "BUY"
+                ? Math.max(openTrade.sl, livePsar)
+                : Math.min(openTrade.sl, livePsar);
+              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+              dbg(`PSAR aligned for open trade. New SL: ${openTrade.sl.toFixed(4)}`);
+            }
+          } else {
+            const oldSl = openTrade.sl;
             openTrade.sl = openTrade.direction === "BUY"
               ? Math.max(openTrade.sl, livePsar)
               : Math.min(openTrade.sl, livePsar);
-            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-            dbg(`PSAR aligned for open trade. New SL: ${openTrade.sl.toFixed(4)}`);
-          }
-        } else {
-          const oldSl = openTrade.sl;
-          openTrade.sl = openTrade.direction === "BUY"
-            ? Math.max(openTrade.sl, livePsar)
-            : Math.min(openTrade.sl, livePsar);
-          if (openTrade.sl !== oldSl) {
-            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-            dbg(`PSAR ratcheted SL from ${oldSl.toFixed(4)} to ${openTrade.sl.toFixed(4)}`);
+            if (openTrade.sl !== oldSl) {
+              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+              dbg(`PSAR ratcheted SL from ${oldSl.toFixed(4)} to ${openTrade.sl.toFixed(4)}`);
+            }
           }
         }
       }
-    }
 
-    const closeWith = async (result, exitReason) => {
-      let serverPnl = pnl;
-      if (openTrade.contractId) {
-        try {
-          const closeRes = await closeContract(openTrade.contractId);
-          if (!closeRes || closeRes.error) {
-            const errCode = closeRes.error?.code;
-            const errDesc = closeRes.error?.message || JSON.stringify(closeRes.error);
-            if (errCode === "ContractNotFound" || errDesc.includes("not found among your open positions")) {
-              serverPnl = -5.00;
+      const closeWith = async (result, exitReason) => {
+        let serverPnl = pnl;
+        if (openTrade.contractId) {
+          try {
+            const closeRes = await closeContract(openTrade.contractId);
+            if (!closeRes || closeRes.error) {
+              const errCode = closeRes.error?.code;
+              const errDesc = closeRes.error?.message || JSON.stringify(closeRes.error);
+              if (errCode === "ContractNotFound" || errDesc.includes("not found among your open positions")) {
+                serverPnl = -5.00;
+              } else {
+                console.error(`⚠️ Failed to close contract on Deriv: ${errDesc}`);
+                await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Warning\n\nFailed to close contract \`${openTrade.contractId}\` on Deriv: ${errDesc}. Retrying next scan.`);
+                return;
+              }
+            } else if (typeof closeRes.sell?.profit === 'number') {
+              serverPnl = closeRes.sell.profit;
+            }
+          } catch (e) {
+            if (e.message.includes("ContractNotFound") || e.message.includes("not found among your open positions")) {
+              serverPnl = -5.00; // Proceed with local close
             } else {
-              console.error(`⚠️ Failed to close contract on Deriv: ${errDesc}`);
-              await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Warning\n\nFailed to close contract \`${openTrade.contractId}\` on Deriv: ${errDesc}. Retrying next scan.`);
+              console.error("Close exception:", e.message);
+              await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Error\n\nException closing contract \`${openTrade.contractId}\`: ${e.message}. Retrying next scan.`);
               return;
             }
-          } else if (typeof closeRes.sell?.profit === 'number') {
-            serverPnl = closeRes.sell.profit;
-          }
-        } catch (e) {
-          if (e.message.includes("ContractNotFound") || e.message.includes("not found among your open positions")) {
-            serverPnl = -5.00; // Proceed with local close
-          } else {
-            console.error("Close exception:", e.message);
-            await sendTelegram(`⚠️ *${REPO_LABEL}* — Close Error\n\nException closing contract \`${openTrade.contractId}\`: ${e.message}. Retrying next scan.`);
-            return;
           }
         }
-      }
 
-      // Derive final result strictly from serverPnl to maintain true P&L integrity
-      const finalResult = (typeof serverPnl === 'number') ? (serverPnl >= 0 ? "WIN" : "LOSS") : result;
-      openTrade.result = finalResult;
-      openTrade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
+        // Derive final result strictly from serverPnl to maintain true P&L integrity
+        const finalResult = (typeof serverPnl === 'number') ? (serverPnl >= 0 ? "WIN" : "LOSS") : result;
+        openTrade.result = finalResult;
+        openTrade.closeTime = new Date().toISOString().replace("T"," ").substring(0,19);
 
-      fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-      const icon = finalResult === "WIN" ? "✅" : "❌";
-      const contractType = openTrade.direction === "BUY" ? "MULTUP" : "MULTDOWN";
-      const durationMs = new Date(openTrade.closeTime) - new Date(openTrade.openTime);
-      const slDollars = parseFloat(STAKE_USD.toFixed(2));
-      const tpDollars = parseFloat((STAKE_USD * RISK_REWARD).toFixed(2));
-      const tp1Status = openTrade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
-      const pnlStr = serverPnl >= 0 ? `+$${serverPnl.toFixed(2)}` : `-$${Math.abs(serverPnl).toFixed(2)}`;
-      
-      await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${finalResult}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
-    };
-
-    // ── 1. Hard SL Price Check (Highest Priority per Spec - Dynamically Driven by PSAR) ──
-    const slBreached = openTrade.direction === "BUY" ? currentPrice <= openTrade.sl : currentPrice >= openTrade.sl;
-    if (slBreached) {
-      await closeWith("LOSS", `Hard SL hit — price ${currentPrice.toFixed(4)} breached SL ${openTrade.sl.toFixed(4)}`);
-      return;
-    }
-
-    // ── 2. TP2 Ultimate Target Hit ──
-    const tp2Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp2 : currentPrice <= openTrade.tp2;
-    if (tp2Hit) {
-      await closeWith("WIN", `TP2 Ultimate Target hit — price ${currentPrice.toFixed(4)} reached BGA level ${openTrade.tp2.toFixed(4)}`);
-      return;
-    }
-
-    // ── 3. Breakeven Protection & Commission-Covered Pullback Exit (Lifetime Floor) ──
-    if (!openTrade.breakevenSet && pnl >= BREAKEVEN_ACTIVATE_USD) {
-      openTrade.breakevenSet = true;
-      fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-      await sendTelegram(`⚖️ *${REPO_LABEL} — Breakeven Armed*\nProfit reached $${BREAKEVEN_ACTIVATE_USD.toFixed(2)}. Price floor locked at entry (${openTrade.entry.toFixed(4)}).`);
-    }
-
-    const targetNetProfit = 0.50;
-    const requiredRawPnl = targetNetProfit + COMMISSION_USD;
-    const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
-    const breakevenPrice = openTrade.direction === "BUY"
-      ? openTrade.entry * (1 + priceMoveFraction)
-      : openTrade.entry * (1 - priceMoveFraction);
-
-    const breakevenHit = openTrade.breakevenSet && (
-      (openTrade.direction === "BUY" && currentPrice <= breakevenPrice) ||
-      (openTrade.direction === "SELL" && currentPrice >= breakevenPrice)
-    );
-    if (breakevenHit) {
-      await closeWith("WIN", `Commission-Covered Breakeven exit — locked +$0.50 net profit at price ${breakevenPrice.toFixed(4)}`);
-      return;
-    }
-
-    // ── 4. TP1 Price Level Hit & High-Water Mark Trailing (50% Trail) ──
-    if (!openTrade.tp1Reached) {
-      const tp1Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1;
-      if (tp1Hit) {
-        openTrade.tp1Reached = true;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-        await sendTelegram(`🎯 TP1 BGA Whole Number reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — 50% peak-drop trailing now armed.`);
-      }
-    }
+        const icon = finalResult === "WIN" ? "✅" : "❌";
+        const contractType = openTrade.direction === "BUY" ? "MULTUP" : "MULTDOWN";
+        const durationMs = new Date(openTrade.closeTime) - new Date(openTrade.openTime);
+        const slDollars = parseFloat(STAKE_USD.toFixed(2));
+        const tpDollars = parseFloat((STAKE_USD * RISK_REWARD).toFixed(2));
+        const tp1Status = openTrade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
+        const pnlStr = serverPnl >= 0 ? `+$${serverPnl.toFixed(2)}` : `-$${Math.abs(serverPnl).toFixed(2)}`;
+        
+        await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${finalResult}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
+      };
 
-    if (openTrade.tp1Reached) {
-      if (openTrade.peakProfit === null || pnl > openTrade.peakProfit) {
-        openTrade.peakProfit = pnl;
-        fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-      }
-      const dropThreshold = openTrade.peakProfit * 0.50; 
-      if (openTrade.peakProfit > 0 && pnl <= openTrade.peakProfit - dropThreshold) {
-        const result = pnl >= 0 ? "WIN" : "LOSS";
-        await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 50% drop from peak)`);
+      // ── 1. Hard SL Price Check (Highest Priority per Spec - Dynamically Driven by PSAR) ──
+      const slBreached = openTrade.direction === "BUY" ? currentPrice <= openTrade.sl : currentPrice >= openTrade.sl;
+      if (slBreached) {
+        await closeWith("LOSS", `Hard SL hit — price ${currentPrice.toFixed(4)} breached SL ${openTrade.sl.toFixed(4)}`);
         return;
       }
-    }
 
-    console.log("Open trade being managed — skipping scan.");
-    return;
-  }
-
-  // ── Signal Scan (Consolidated Data Fetching - M5, H1, D1) ──
-  const scanData = await fetchAllData();
-  const candles = scanData.m5;
-  const h1Candles = scanData.h1;
-  const d1Candles = scanData.d1;
-
-  if (!candles || candles.length < 60) { console.log("Not enough M5 candles."); return; }
-
-  const i = candles.length - 2; // Closed M5 candle to prevent repainting (-2)
-  const currentCandleEpoch = candles[i].epoch;
-  const closes = candles.map(c => parseFloat(c.close));
-
-  if (state.lastProcessedEpoch === currentCandleEpoch) {
-    console.log("Already processed this candle — skipping.");
-    return;
-  }
-
-  const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
-  const psarValues = calculatePSAR(candles, PSAR_STEP, PSAR_MAX);
-  const currentPsar = psarValues[i];
-
-  // 1. Evaluate Fresh H1 Crossover using EXPONENTIAL MOVING AVERAGE (EMA 50) over at least 250 H1 candles
-  let h1FreshBuy = false;
-  let h1FreshSell = false;
-  let h1TrendDir = null;
-  if (h1Candles && h1Candles.length >= 250) {
-    const h1Closes = h1Candles.map(c => parseFloat(c.close));
-    const h1ci = h1Candles.length - 2; // Closed H1 candle
-    const h1PrevCi = h1ci - 1;         // Previous H1 candle
-    const ema50_1h = ema(h1Closes, 50); // <--- Fully converged EMA 50
-
-    if (ema50_1h[h1ci] != null && ema50_1h[h1PrevCi] != null) {
-      h1FreshBuy = (h1Closes[h1PrevCi] <= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] > ema50_1h[h1ci]);
-      h1FreshSell = (h1Closes[h1PrevCi] >= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] < ema50_1h[h1ci]);
-
-      if (h1Closes[h1ci] > ema50_1h[h1ci]) h1TrendDir = "BUY";
-      else if (h1Closes[h1ci] < ema50_1h[h1ci]) h1TrendDir = "SELL";
-    }
-  }
-
-  // Check if we entered a NEW H1 trend cycle via a fresh crossover event
-  let h1NewCycleEpoch = null;
-  if (h1Candles && h1Candles.length >= 250) {
-    const h1ci = h1Candles.length - 2;
-    if (h1FreshBuy || h1FreshSell) {
-      h1NewCycleEpoch = h1Candles[h1ci].epoch;
-    }
-  }
-
-  // ── STEP 1: New H1 cycle detected — reset everything and open a fresh Phase A window ──
-  if (h1NewCycleEpoch && state.h1TrendCycleEpoch !== h1NewCycleEpoch) {
-    state.h1TrendCycleEpoch = h1NewCycleEpoch;
-    state.waitingFor = h1FreshBuy ? "BUY" : "SELL";
-    state.phaseATaken = false;
-    state.phaseAWindowExpired = false;
-    state.phaseADeadlineEpoch = h1NewCycleEpoch + PHASE_A_WINDOW_SECONDS;
-    state.phaseBPending = null;
-    state.phaseBStochFreshSeen = false;
-    state.phaseBCciFreshSeen = false;
-    state.phaseBTdiFreshSeen = false;
-    dbg(`STEP 1: New H1 trend cycle detected at epoch ${h1NewCycleEpoch} (${state.waitingFor}). Phase A window open until ${new Date(state.phaseADeadlineEpoch * 1000).toISOString()}.`);
-  }
-
-  // ── STEP 2: Trend invalidation — if H1 trend flips completely against waitingFor, wipe state ──
-  if (h1TrendDir && state.waitingFor && h1TrendDir !== state.waitingFor) {
-    dbg("STEP 2: H1 trend flipped against waitingFor. Resetting state.");
-    state.waitingFor = null;
-    state.phaseATaken = false;
-    state.h1TrendCycleEpoch = null;
-    state.phaseADeadlineEpoch = null;
-    state.phaseAWindowExpired = false;
-    state.phaseBPending = null;
-    state.phaseBStochFreshSeen = false;
-    state.phaseBCciFreshSeen = false;
-    state.phaseBTdiFreshSeen = false;
-  }
-
-  // ── STEP 3: Cold-boot adoption — ONLY runs if waitingFor is currently null (no cycle tracked at all) ──
-  if (!state.waitingFor && h1TrendDir) {
-    state.waitingFor = h1TrendDir;
-    state.h1TrendCycleEpoch = currentCandleEpoch;
-    state.phaseATaken = false;
-    state.phaseAWindowExpired = false;
-    state.phaseADeadlineEpoch = currentCandleEpoch + PHASE_A_WINDOW_SECONDS;
-    dbg(`STEP 3: Cold-boot adoption — no cycle was tracked. Adopting ${h1TrendDir}. Phase A window open until ${new Date(state.phaseADeadlineEpoch * 1000).toISOString()}.`);
-  }
-
-  // ── STEP 4: Legacy migration — ONLY runs if waitingFor IS already set, but is missing a deadline ──
-  if (state.waitingFor && !state.phaseATaken && !state.phaseAWindowExpired && !state.phaseADeadlineEpoch) {
-    const nowEpoch = Math.floor(Date.now() / 1000);
-    if (state.h1TrendCycleEpoch) {
-      const properDeadline = state.h1TrendCycleEpoch + PHASE_A_WINDOW_SECONDS;
-      if (nowEpoch > properDeadline) {
-        state.phaseAWindowExpired = true;
-        dbg(`STEP 4: Legacy migration — original H1 cross was at ${new Date(state.h1TrendCycleEpoch * 1000).toISOString()}, deadline already passed. Marking Phase A EXPIRED — falling back to Phase B.`);
-      } else {
-        state.phaseADeadlineEpoch = properDeadline;
-        dbg(`STEP 4: Legacy migration — restored Phase A deadline from original cycle epoch, open until ${new Date(properDeadline * 1000).toISOString()}.`);
+      // ── 2. TP2 Ultimate Target Hit ──
+      const tp2Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp2 : currentPrice <= openTrade.tp2;
+      if (tp2Hit) {
+        await closeWith("WIN", `TP2 Ultimate Target hit — price ${currentPrice.toFixed(4)} reached BGA level ${openTrade.tp2.toFixed(4)}`);
+        return;
       }
-    } else {
-      state.phaseAWindowExpired = true;
-      dbg(`STEP 4: Legacy migration — no h1TrendCycleEpoch on record. Marking Phase A EXPIRED — falling back to Phase B.`);
-    }
-  }
 
-  // ── STEP 5: If still no active trend to track, exit early ──
-  if (!state.waitingFor) {
-    state.lastProcessedEpoch = currentCandleEpoch;
-    fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
-    return;
-  }
+      // ── 3. Breakeven Protection & Server-Truth Pullback Exit (Lifetime Floor: $0.70 Net) ──
+      if (!openTrade.breakevenSet && pnl >= BREAKEVEN_ACTIVATE_USD) {
+        openTrade.breakevenSet = true;
+        fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+        await sendTelegram(`⚖️ *${REPO_LABEL} — Breakeven Armed*\nProfit reached $${pnl.toFixed(2)}. Lifetime profit floor locked at +$0.70 net.`);
+      }
 
-  // 2. Indicator Calculations for Phase A & B (Closed M5 candle index: si)
-  const si = candles.length - 2;
-  const stoch = calculateStochastic(candles, 5, 3, 3);
-  const cci = calculateCCI(candles, 34);
-  const rsi = calculateRSI(closes, 14);
-  const tdi = calculateBollingerBands(rsi, 34, 1.619);
+      const targetNetProfit = 0.70; // Server-truth profit lock floor ($0.70 net)
+      const breakevenHit = openTrade.breakevenSet && pnl <= targetNetProfit;
+      if (breakevenHit) {
+        await closeWith("WIN", `Commission-Covered Breakeven exit — locked +$${pnl.toFixed(2)} net profit (target $${targetNetProfit.toFixed(2)})`);
+        return;
+      }
 
-  let signalTriggered = false, direction = "", entry, sl, risk, tp1, tp2, tp3;
-  let entryType = null;
-
-  if (si >= 1 && stoch.k[si] != null && stoch.d[si] != null && stoch.k[si-1] != null && stoch.d[si-1] != null &&
-      cci[si] != null && cci[si-1] != null && rsi[si] != null && rsi[si-1] != null && tdi.middle[si] != null && tdi.middle[si-1] != null) {
-
-    // --- PHASE A: Must take the very first trade within PHASE_A_WINDOW_SECONDS of the fresh H1 EMA 50 cross ---
-    if (!state.phaseATaken && !state.phaseAWindowExpired) {
-      const deadlinePassed = state.phaseADeadlineEpoch && currentCandleEpoch > state.phaseADeadlineEpoch;
-
-      if (deadlinePassed) {
-        state.phaseAWindowExpired = true;
-        dbg(`Phase A window EXPIRED at ${new Date(currentCandleEpoch*1000).toISOString()} — no fill. Falling back to Phase B monitoring.`);
-      } else {
-        // Strict AND operator for prior candle oversold/overbought per spec
-        const stochCrossBuyPhaseA = (stoch.k[si-1] <= 20 && stoch.d[si-1] <= 20) &&
-                                    (stoch.k[si] > 20 && stoch.d[si] > 20) &&
-                                    (stoch.k[si-1] <= stoch.d[si-1]) &&
-                                    (stoch.k[si] > stoch.d[si]);
-
-        const stochCrossSellPhaseA = (stoch.k[si-1] >= 80 && stoch.d[si-1] >= 80) &&
-                                     (stoch.k[si] < 80 && stoch.d[si] < 80) &&
-                                     (stoch.k[si-1] >= stoch.d[si-1]) &&
-                                     (stoch.k[si] < stoch.d[si]);
-
-        if (state.waitingFor === "BUY" && stochCrossBuyPhaseA) {
-          signalTriggered = true;
-          direction = "BUY";
-          entry = closes[i];
-          entryType = 'PHASE_A';
-          state.phaseATaken = true;
-        } else if (state.waitingFor === "SELL" && stochCrossSellPhaseA) {
-          signalTriggered = true;
-          direction = "SELL";
-          entry = closes[i];
-          entryType = 'PHASE_A';
-          state.phaseATaken = true;
+      // ── 4. TP1 Price Level Hit & High-Water Mark Trailing (50% Trail) ──
+      if (!openTrade.tp1Reached) {
+        const tp1Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1;
+        if (tp1Hit) {
+          openTrade.tp1Reached = true;
+          fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+          await sendTelegram(`🎯 TP1 BGA Whole Number reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — 50% peak-drop trailing now armed.`);
         }
       }
+
+      if (openTrade.tp1Reached) {
+        if (openTrade.peakProfit === null || pnl > openTrade.peakProfit) {
+          openTrade.peakProfit = pnl;
+          fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+        }
+        const dropThreshold = openTrade.peakProfit * 0.50; 
+        if (openTrade.peakProfit > 0 && pnl <= openTrade.peakProfit - dropThreshold) {
+          const result = pnl >= 0 ? "WIN" : "LOSS";
+          await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 50% drop from peak)`);
+          return;
+        }
+      }
+
+      console.log("Open trade being managed — skipping scan.");
+      return;
     }
 
-    // --- PHASE B: Stateful Re-entry Engine (fires after a real Phase A fill, OR after Phase A window expires unfilled) ---
-    if (!signalTriggered && (state.phaseATaken || state.phaseAWindowExpired)) {
-      // 50-level cross on Stochastic main line (%K)
-      const stochCrossBuyB = (stoch.k[si-1] <= 50) && (stoch.k[si] > 50);
-      const stochCrossSellB = (stoch.k[si-1] >= 50) && (stoch.k[si] < 50);
+    // ── Signal Scan (Consolidated Data Fetching - M5, H1, D1) ──
+    const scanData = await fetchAllData();
+    const candles = scanData.m5;
+    const h1Candles = scanData.h1;
+    const d1Candles = scanData.d1;
 
-      const cciCrossBuyB = cci[si-1] <= 0 && cci[si] > 0;
-      const cciCrossSellB = cci[si-1] >= 0 && cci[si] < 0;
+    if (!candles || candles.length < 60) { console.log("Not enough M5 candles."); return; }
 
-      const tdiCrossBuyB = rsi[si-1] <= tdi.middle[si-1] && rsi[si] > tdi.middle[si];
-      const tdiCrossSellB = rsi[si-1] >= tdi.middle[si-1] && rsi[si] < tdi.middle[si];
+    const i = candles.length - 2; // Closed M5 candle to prevent repainting (-2)
+    const currentCandleEpoch = candles[i].epoch;
+    const closes = candles.map(c => parseFloat(c.close));
 
-      if (state.waitingFor === "BUY") {
-        // De-alignment reset checks
-        if (stoch.k[si] < 50) state.phaseBStochFreshSeen = false;
-        if (cci[si] < 0) state.phaseBCciFreshSeen = false;
-        if (rsi[si] < tdi.middle[si]) state.phaseBTdiFreshSeen = false;
+    if (state.lastProcessedEpoch === currentCandleEpoch) {
+      console.log("Already processed this candle — skipping.");
+      return;
+    }
 
-        // Arm Phase B upon the first fresh cross
-        if (!state.phaseBPending) {
-          if (stochCrossBuyB || cciCrossBuyB || tdiCrossBuyB) {
-            state.phaseBPending = "BUY";
+    const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
+    const psarValues = calculatePSAR(candles, PSAR_STEP, PSAR_MAX);
+    const currentPsar = psarValues[i];
+
+    // 1. Evaluate Fresh H1 Crossover using EXPONENTIAL MOVING AVERAGE (EMA 50) over at least 250 H1 candles
+    let h1FreshBuy = false;
+    let h1FreshSell = false;
+    let h1TrendDir = null;
+    if (h1Candles && h1Candles.length >= 250) {
+      const h1Closes = h1Candles.map(c => parseFloat(c.close));
+      const h1ci = h1Candles.length - 2; // Closed H1 candle
+      const h1PrevCi = h1ci - 1;         // Previous H1 candle
+      const ema50_1h = ema(h1Closes, 50); // <--- Fully converged EMA 50
+
+      if (ema50_1h[h1ci] != null && ema50_1h[h1PrevCi] != null) {
+        h1FreshBuy = (h1Closes[h1PrevCi] <= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] > ema50_1h[h1ci]);
+        h1FreshSell = (h1Closes[h1PrevCi] >= ema50_1h[h1PrevCi]) && (h1Closes[h1ci] < ema50_1h[h1ci]);
+
+        if (h1Closes[h1ci] > ema50_1h[h1ci]) h1TrendDir = "BUY";
+        else if (h1Closes[h1ci] < ema50_1h[h1ci]) h1TrendDir = "SELL";
+      }
+    }
+
+    // Check if we entered a NEW H1 trend cycle via a fresh crossover event
+    let h1NewCycleEpoch = null;
+    if (h1Candles && h1Candles.length >= 250) {
+      const h1ci = h1Candles.length - 2;
+      if (h1FreshBuy || h1FreshSell) {
+        h1NewCycleEpoch = h1Candles[h1ci].epoch;
+      }
+    }
+
+    // ── STEP 1: New H1 cycle detected — reset everything and open a fresh Phase A window ──
+    if (h1NewCycleEpoch && state.h1TrendCycleEpoch !== h1NewCycleEpoch) {
+      state.h1TrendCycleEpoch = h1NewCycleEpoch;
+      state.waitingFor = h1FreshBuy ? "BUY" : "SELL";
+      state.phaseATaken = false;
+      state.phaseAWindowExpired = false;
+      state.phaseADeadlineEpoch = h1NewCycleEpoch + PHASE_A_WINDOW_SECONDS;
+      state.phaseBPending = null;
+      state.phaseBStochFreshSeen = false;
+      state.phaseBCciFreshSeen = false;
+      state.phaseBTdiFreshSeen = false;
+      dbg(`STEP 1: New H1 trend cycle detected at epoch ${h1NewCycleEpoch} (${state.waitingFor}). Phase A window open until ${new Date(state.phaseADeadlineEpoch * 1000).toISOString()}.`);
+    }
+
+    // ── STEP 2: Trend invalidation — if H1 trend flips completely against waitingFor, wipe state ──
+    if (h1TrendDir && state.waitingFor && h1TrendDir !== state.waitingFor) {
+      dbg("STEP 2: H1 trend flipped against waitingFor. Resetting state.");
+      state.waitingFor = null;
+      state.phaseATaken = false;
+      state.h1TrendCycleEpoch = null;
+      state.phaseADeadlineEpoch = null;
+      state.phaseAWindowExpired = false;
+      state.phaseBPending = null;
+      state.phaseBStochFreshSeen = false;
+      state.phaseBCciFreshSeen = false;
+      state.phaseBTdiFreshSeen = false;
+    }
+
+    // ── STEP 3: Cold-boot adoption — ONLY runs if waitingFor is currently null (no cycle tracked at all) ──
+    if (!state.waitingFor && h1TrendDir) {
+      state.waitingFor = h1TrendDir;
+      state.h1TrendCycleEpoch = currentCandleEpoch;
+      state.phaseATaken = false;
+      state.phaseAWindowExpired = false;
+      state.phaseADeadlineEpoch = currentCandleEpoch + PHASE_A_WINDOW_SECONDS;
+      dbg(`STEP 3: Cold-boot adoption — no cycle was tracked. Adopting ${h1TrendDir}. Phase A window open until ${new Date(state.phaseADeadlineEpoch * 1000).toISOString()}.`);
+    }
+
+    // ── STEP 4: Legacy migration — ONLY runs if waitingFor IS already set, but is missing a deadline ──
+    if (state.waitingFor && !state.phaseATaken && !state.phaseAWindowExpired && !state.phaseADeadlineEpoch) {
+      const nowEpoch = Math.floor(Date.now() / 1000);
+      if (state.h1TrendCycleEpoch) {
+        const properDeadline = state.h1TrendCycleEpoch + PHASE_A_WINDOW_SECONDS;
+        if (nowEpoch > properDeadline) {
+          state.phaseAWindowExpired = true;
+          dbg(`STEP 4: Legacy migration — original H1 cross was at ${new Date(state.h1TrendCycleEpoch * 1000).toISOString()}, deadline already passed. Marking Phase A EXPIRED — falling back to Phase B.`);
+        } else {
+          state.phaseADeadlineEpoch = properDeadline;
+          dbg(`STEP 4: Legacy migration — restored Phase A deadline from original cycle epoch, open until ${new Date(properDeadline * 1000).toISOString()}.`);
+        }
+      } else {
+        state.phaseAWindowExpired = true;
+        dbg(`STEP 4: Legacy migration — no h1TrendCycleEpoch on record. Marking Phase A EXPIRED — falling back to Phase B.`);
+      }
+    }
+
+    // ── STEP 5: If still no active trend to track, exit early ──
+    if (!state.waitingFor) {
+      state.lastProcessedEpoch = currentCandleEpoch;
+      fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+      return;
+    }
+
+    // 2. Indicator Calculations for Phase A & B (Closed M5 candle index: si)
+    const si = candles.length - 2;
+    const stoch = calculateStochastic(candles, 5, 3, 3);
+    const cci = calculateCCI(candles, 34);
+    const rsi = calculateRSI(closes, 14);
+    const tdi = calculateBollingerBands(rsi, 34, 1.619);
+
+    let signalTriggered = false, direction = "", entry, sl, risk, tp1, tp2, tp3;
+    let entryType = null;
+
+    if (si >= 1 && stoch.k[si] != null && stoch.d[si] != null && stoch.k[si-1] != null && stoch.d[si-1] != null &&
+        cci[si] != null && cci[si-1] != null && rsi[si] != null && rsi[si-1] != null && tdi.middle[si] != null && tdi.middle[si-1] != null) {
+
+      // --- PHASE A: Must take the very first trade within PHASE_A_WINDOW_SECONDS of the fresh H1 EMA 50 cross ---
+      if (!state.phaseATaken && !state.phaseAWindowExpired) {
+        const deadlinePassed = state.phaseADeadlineEpoch && currentCandleEpoch > state.phaseADeadlineEpoch;
+
+        if (deadlinePassed) {
+          state.phaseAWindowExpired = true;
+          dbg(`Phase A window EXPIRED at ${new Date(currentCandleEpoch*1000).toISOString()} — no fill. Falling back to Phase B monitoring.`);
+        } else {
+          // Strict AND operator for prior candle oversold/overbought per spec
+          const stochCrossBuyPhaseA = (stoch.k[si-1] <= 20 && stoch.d[si-1] <= 20) &&
+                                      (stoch.k[si] > 20 && stoch.d[si] > 20) &&
+                                      (stoch.k[si-1] <= stoch.d[si-1]) &&
+                                      (stoch.k[si] > stoch.d[si]);
+
+          const stochCrossSellPhaseA = (stoch.k[si-1] >= 80 && stoch.d[si-1] >= 80) &&
+                                       (stoch.k[si] < 80 && stoch.d[si] < 80) &&
+                                       (stoch.k[si-1] >= stoch.d[si-1]) &&
+                                       (stoch.k[si] < stoch.d[si]);
+
+          if (state.waitingFor === "BUY" && stochCrossBuyPhaseA) {
+            signalTriggered = true;
+            direction = "BUY";
+            entry = closes[i];
+            entryType = 'PHASE_A';
+            state.phaseATaken = true;
+          } else if (state.waitingFor === "SELL" && stochCrossSellPhaseA) {
+            signalTriggered = true;
+            direction = "SELL";
+            entry = closes[i];
+            entryType = 'PHASE_A';
+            state.phaseATaken = true;
+          }
+        }
+      }
+
+      // --- PHASE B: Stateful Re-entry Engine (fires after a real Phase A fill, OR after Phase A window expires unfilled) ---
+      if (!signalTriggered && (state.phaseATaken || state.phaseAWindowExpired)) {
+        const stochCrossBuyB = (stoch.k[si-1] <= 50) && (stoch.k[si] > 50);
+        const stochCrossSellB = (stoch.k[si-1] >= 50) && (stoch.k[si] < 50);
+
+        const cciCrossBuyB = cci[si-1] <= 0 && cci[si] > 0;
+        const cciCrossSellB = cci[si-1] >= 0 && cci[si] < 0;
+
+        const tdiCrossBuyB = rsi[si-1] <= tdi.middle[si-1] && rsi[si] > tdi.middle[si];
+        const tdiCrossSellB = rsi[si-1] >= tdi.middle[si-1] && rsi[si] < tdi.middle[si];
+
+        if (state.waitingFor === "BUY") {
+          if (stoch.k[si] < 50) state.phaseBStochFreshSeen = false;
+          if (cci[si] < 0) state.phaseBCciFreshSeen = false;
+          if (rsi[si] < tdi.middle[si]) state.phaseBTdiFreshSeen = false;
+
+          if (!state.phaseBPending) {
+            if (stochCrossBuyB || cciCrossBuyB || tdiCrossBuyB) {
+              state.phaseBPending = "BUY";
+              if (stochCrossBuyB) state.phaseBStochFreshSeen = true;
+              if (cciCrossBuyB) state.phaseBCciFreshSeen = true;
+              if (tdiCrossBuyB) state.phaseBTdiFreshSeen = true;
+              dbg("Phase B BUY armed by initial fresh cross.");
+            }
+          } else {
             if (stochCrossBuyB) state.phaseBStochFreshSeen = true;
             if (cciCrossBuyB) state.phaseBCciFreshSeen = true;
             if (tdiCrossBuyB) state.phaseBTdiFreshSeen = true;
-            dbg("Phase B BUY armed by initial fresh cross.");
           }
-        } else {
-          if (stochCrossBuyB) state.phaseBStochFreshSeen = true;
-          if (cciCrossBuyB) state.phaseBCciFreshSeen = true;
-          if (tdiCrossBuyB) state.phaseBTdiFreshSeen = true;
-        }
 
-        if (state.phaseBPending === "BUY" && !state.phaseBStochFreshSeen && !state.phaseBCciFreshSeen && !state.phaseBTdiFreshSeen) {
-          state.phaseBPending = null;
-        }
+          if (state.phaseBPending === "BUY" && !state.phaseBStochFreshSeen && !state.phaseBCciFreshSeen && !state.phaseBTdiFreshSeen) {
+            state.phaseBPending = null;
+          }
 
-        if (state.phaseBPending === "BUY" && state.phaseBStochFreshSeen && state.phaseBCciFreshSeen && state.phaseBTdiFreshSeen) {
-          signalTriggered = true;
-          direction = "BUY";
-          entry = closes[i];
-          entryType = state.phaseATaken ? 'PHASE_B' : 'PHASE_B_NO_PRIOR_A';
-          state.phaseBPending = null;
-          state.phaseBStochFreshSeen = false;
-          state.phaseBCciFreshSeen = false;
-          state.phaseBTdiFreshSeen = false;
-        }
+          if (state.phaseBPending === "BUY" && state.phaseBStochFreshSeen && state.phaseBCciFreshSeen && state.phaseBTdiFreshSeen) {
+            signalTriggered = true;
+            direction = "BUY";
+            entry = closes[i];
+            entryType = state.phaseATaken ? 'PHASE_B' : 'PHASE_B_NO_PRIOR_A';
+            state.phaseBPending = null;
+            state.phaseBStochFreshSeen = false;
+            state.phaseBCciFreshSeen = false;
+            state.phaseBTdiFreshSeen = false;
+          }
 
-      } else if (state.waitingFor === "SELL") {
-        // De-alignment reset checks
-        if (stoch.k[si] > 50) state.phaseBStochFreshSeen = false;
-        if (cci[si] > 0) state.phaseBCciFreshSeen = false;
-        if (rsi[si] > tdi.middle[si]) state.phaseBTdiFreshSeen = false;
+        } else if (state.waitingFor === "SELL") {
+          if (stoch.k[si] > 50) state.phaseBStochFreshSeen = false;
+          if (cci[si] > 0) state.phaseBCciFreshSeen = false;
+          if (rsi[si] > tdi.middle[si]) state.phaseBTdiFreshSeen = false;
 
-        // Arm Phase B upon the first fresh cross
-        if (!state.phaseBPending) {
-          if (stochCrossSellB || cciCrossSellB || tdiCrossSellB) {
-            state.phaseBPending = "SELL";
+          if (!state.phaseBPending) {
+            if (stochCrossSellB || cciCrossSellB || tdiCrossSellB) {
+              state.phaseBPending = "SELL";
+              if (stochCrossSellB) state.phaseBStochFreshSeen = true;
+              if (cciCrossSellB) state.phaseBCciFreshSeen = true;
+              if (tdiCrossSellB) state.phaseBTdiFreshSeen = true;
+              dbg("Phase B SELL armed by initial fresh cross.");
+            }
+          } else {
             if (stochCrossSellB) state.phaseBStochFreshSeen = true;
             if (cciCrossSellB) state.phaseBCciFreshSeen = true;
             if (tdiCrossSellB) state.phaseBTdiFreshSeen = true;
-            dbg("Phase B SELL armed by initial fresh cross.");
           }
+
+          if (state.phaseBPending === "SELL" && !state.phaseBStochFreshSeen && !state.phaseBCciFreshSeen && !state.phaseBTdiFreshSeen) {
+            state.phaseBPending = null;
+          }
+
+          if (state.phaseBPending === "SELL" && state.phaseBStochFreshSeen && state.phaseBCciFreshSeen && state.phaseBTdiFreshSeen) {
+            signalTriggered = true;
+            direction = "SELL";
+            entry = closes[i];
+            entryType = state.phaseATaken ? 'PHASE_B' : 'PHASE_B_NO_PRIOR_A';
+            state.phaseBPending = null;
+            state.phaseBStochFreshSeen = false;
+            state.phaseBCciFreshSeen = false;
+            state.phaseBTdiFreshSeen = false;
+          }
+        }
+      }
+    }
+
+    if (signalTriggered) {
+      const slDollars = parseFloat(STAKE_USD.toFixed(2));
+      let psarAligned = false;
+
+      // Check if PSAR is already aligned with trade direction at entry
+      if (direction === "BUY") {
+        if (currentPsar != null && currentPsar < entry) {
+          sl = currentPsar;
+          psarAligned = true;
         } else {
-          if (stochCrossSellB) state.phaseBStochFreshSeen = true;
-          if (cciCrossSellB) state.phaseBCciFreshSeen = true;
-          if (tdiCrossSellB) state.phaseBTdiFreshSeen = true;
+          // Unaligned fallback: exact price level for -$5.00 loss net of commission
+          const targetLoss = -5.00;
+          const requiredRawPnl = targetLoss + COMMISSION_USD;
+          const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
+          sl = entry * (1 + priceMoveFraction);
+          psarAligned = false;
         }
-
-        if (state.phaseBPending === "SELL" && !state.phaseBStochFreshSeen && !state.phaseBCciFreshSeen && !state.phaseBTdiFreshSeen) {
-          state.phaseBPending = null;
-        }
-
-        if (state.phaseBPending === "SELL" && state.phaseBStochFreshSeen && state.phaseBCciFreshSeen && state.phaseBTdiFreshSeen) {
-          signalTriggered = true;
-          direction = "SELL";
-          entry = closes[i];
-          entryType = state.phaseATaken ? 'PHASE_B' : 'PHASE_B_NO_PRIOR_A';
-          state.phaseBPending = null;
-          state.phaseBStochFreshSeen = false;
-          state.phaseBCciFreshSeen = false;
-          state.phaseBTdiFreshSeen = false;
-        }
-      }
-    }
-  }
-
-  if (signalTriggered) {
-    const slDollars = parseFloat(STAKE_USD.toFixed(2));
-    let psarAligned = false;
-
-    // Check if PSAR is already aligned with trade direction at entry
-    if (direction === "BUY") {
-      if (currentPsar != null && currentPsar < entry) {
-        sl = currentPsar;
-        psarAligned = true;
+        risk = entry - sl;
       } else {
-        // Unaligned fallback: exact price level for -$5.00 loss net of commission
-        const targetLoss = -5.00;
-        const requiredRawPnl = targetLoss + COMMISSION_USD;
-        const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
-        sl = entry * (1 + priceMoveFraction);
-        psarAligned = false;
+        if (currentPsar != null && currentPsar > entry) {
+          sl = currentPsar;
+          psarAligned = true;
+        } else {
+          // Unaligned fallback: exact price level for -$5.00 loss net of commission
+          const targetLoss = -5.00;
+          const requiredRawPnl = targetLoss + COMMISSION_USD;
+          const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
+          sl = entry * (1 - priceMoveFraction);
+          psarAligned = false;
+        }
+        risk = sl - entry;
       }
-      risk = entry - sl;
-    } else {
-      if (currentPsar != null && currentPsar > entry) {
-        sl = currentPsar;
-        psarAligned = true;
-      } else {
-        // Unaligned fallback: exact price level for -$5.00 loss net of commission
-        const targetLoss = -5.00;
-        const requiredRawPnl = targetLoss + COMMISSION_USD;
-        const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
-        sl = entry * (1 - priceMoveFraction);
-        psarAligned = false;
-      }
-      risk = sl - entry;
-    }
 
-    const slDistance = risk;
-    const bgaTps = await calculateBgaTakeProfits(entry, direction, slDistance, d1Candles);
-    tp1 = bgaTps.tp1;
-    tp2 = bgaTps.tp2;
-    tp3 = bgaTps.tp3;
+      const slDistance = risk;
+      const bgaTps = await calculateBgaTakeProfits(entry, direction, slDistance, d1Candles);
+      tp1 = bgaTps.tp1;
+      tp2 = bgaTps.tp2;
+      tp3 = bgaTps.tp3;
 
-    const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
-    const bgaTag = getBGAInfo(entry);
+      const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
+      const bgaTag = getBGAInfo(entry);
 
-    const setupLabel = entryType === 'PHASE_B_NO_PRIOR_A'
-      ? 'PHASE B (Phase A window expired unfilled — fallback re-entry)'
-      : `${entryType} (H1 EMA 50, ${PHASE_A_WINDOW_SECONDS/3600}h Phase A window)`;
+      const setupLabel = entryType === 'PHASE_B_NO_PRIOR_A'
+        ? 'PHASE B (Phase A window expired unfilled — fallback re-entry)'
+        : `${entryType} (H1 EMA 50, ${PHASE_A_WINDOW_SECONDS/3600}h Phase A window)`;
 
-    const psarLabel = psarAligned ? "(Live PSAR)" : "($5 Hard-Stop Floor — PSAR pending alignment)";
+      const psarLabel = psarAligned ? "(Live PSAR)" : "($5 Hard-Stop Floor — PSAR pending alignment)";
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard, ${psarLabel})\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${setupLabel}\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
+      let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard, ${psarLabel})\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${setupLabel}\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
-    try {
-      const contractId = await executeTrade(direction);
-      if (!contractId) {
-        console.error("⚠️ Trade execution returned no contract ID. Skipping trade record.");
-        await sendTelegram(`❌ *${REPO_LABEL}* — Signal triggered for ${direction}, but live broker execution failed. Trade aborted.`);
+      // ── PART B: Persist state and pending trade attempt immediately BEFORE executeTrade ──
+      state.lastProcessedEpoch = currentCandleEpoch;
+      fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+
+      const pendingTradeRecord = {
+        id: `${SYMBOL}-${isoTime}`,
+        contractId: null,
+        pending: true,
+        repo: REPO_LABEL,
+        symbol: SYMBOL,
+        direction,
+        entry,
+        sl,
+        tp1,
+        tp2,
+        tp3,
+        h1OpenAtEntry: null,
+        tp1Reached: false,
+        breakevenSet: false,
+        peakProfit: null,
+        rr: RISK_REWARD,
+        entryType,
+        psarAligned,
+        openTime: timeFormatted,
+        closeTime: null,
+        result: null
+      };
+      trades.push(pendingTradeRecord);
+      fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+
+      try {
+        const contractId = await executeTrade(direction);
+        if (!contractId) {
+          console.error("⚠️ Trade execution returned no contract ID. Removing pending trade record.");
+          const idx = trades.findIndex(t => t.id === pendingTradeRecord.id);
+          if (idx !== -1) trades.splice(idx, 1);
+          fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+          await sendTelegram(`❌ *${REPO_LABEL}* — Signal triggered for ${direction}, but broker returned no contract ID. Trade aborted.`);
+          return;
+        }
+
+        // Execution confirmed: update record in-place
+        pendingTradeRecord.contractId = contractId;
+        pendingTradeRecord.pending = false;
+        fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+        await sendTelegram(message);
+      } catch (execErr) {
+        console.error("⚠️ Live execution error:", execErr.message);
+        const idx = trades.findIndex(t => t.id === pendingTradeRecord.id);
+        if (idx !== -1) trades.splice(idx, 1);
+        fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+        await sendTelegram(`❌ *${REPO_LABEL}* — Live execution failed: ${execErr.message}`);
         return;
       }
-      await sendTelegram(message);
-      trades.push({
-        id: `${SYMBOL}-${isoTime}`, contractId, repo: REPO_LABEL, symbol: SYMBOL,
-        direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry: null, tp1Reached: false,
-        breakevenSet: false, peakProfit: null, rr: RISK_REWARD, entryType: entryType, 
-        psarAligned, openTime: timeFormatted, closeTime: null, result: null
-      });
-      fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-    } catch (execErr) {
-      console.error("⚠️ Live execution warning:", execErr.message);
-      await sendTelegram(`❌ *${REPO_LABEL}* — Live execution warning: ${execErr.message}`);
-      return;
     }
-  }
 
-  state.lastProcessedEpoch = currentCandleEpoch;
-  fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
-  console.log(`[${REPO_LABEL}] Scan complete.`);
+    state.lastProcessedEpoch = currentCandleEpoch;
+    fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+    console.log(`[${REPO_LABEL}] Scan complete.`);
+  } finally {
+    // Ensure lock file is cleaned up regardless of errors or early returns
+    try {
+      if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE);
+    } catch {}
+  }
 }
 
 // ==================== EXECUTION MODES ====================
