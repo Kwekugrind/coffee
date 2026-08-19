@@ -30,8 +30,8 @@ const STAKE_USD = 5;
 const RISK_REWARD = 1.5;
 const SAFETY_TP_USD = 10.00; // $10 flat profit insurance ceiling on broker side
 const BREAKEVEN_ACTIVATE_USD = 2.00; // Move SL to entry once profit hits $2.00
-const ATR_PERIOD = 14;
-const ATR_MULTIPLIER = 2.0; // Stop loss breathing room
+const PSAR_STEP = 0.010; // Parabolic SAR acceleration factor step
+const PSAR_MAX = 0.070;  // Parabolic SAR maximum acceleration factor
 const MARKET_DATA_APP_ID = "1089"; // Dedicated public App ID for unauthenticated candle data
 const DERIV_APP_ID = process.env.DERIV_APP_ID || "67418"; // Personal App ID for trading/OTP
 const TG_TOKEN = process.env.TG_BOT_TOKEN || process.env.TG_TOKEN;
@@ -46,7 +46,7 @@ const M5 = 5 * 60;
 const H1 = 60 * 60;
 const D1 = 24 * 60 * 60;
 
-const PHASE_A_WINDOW_SECONDS = 2.5 * 60 * 60; // Strict 2h 30m window (9,000 seconds) for Phase A after H1 fresh cross
+const PHASE_A_WINDOW_SECONDS = 2.5 * 60 * 60; // 2h 30m window for Phase A after H1 fresh cross
 
 const DEBUG = process.env.DEBUG === "true";
 function dbg(...a) { if (DEBUG) console.log("[DBG]", ...a); }
@@ -249,14 +249,14 @@ async function fetchAllData() {
   });
 }
 
-// CONSOLIDATED OPEN TRADE FETCHER (Price + M5 Candles in ONE connection)
+// CONSOLIDATED OPEN TRADE FETCHER (Price + 120 M5 Candles for consistent live PSAR calculation)
 async function fetchOpenTradeData() {
   return withRetry(async () => {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${MARKET_DATA_APP_ID}`);
       const results = {};
       ws.on("open", () => {
-        ws.send(JSON.stringify({ req_id: 1, ticks_history: SYMBOL, granularity: M5, count: 50, end: "latest", style: "candles" }));
+        ws.send(JSON.stringify({ req_id: 1, ticks_history: SYMBOL, granularity: M5, count: 120, end: "latest", style: "candles" }));
         ws.send(JSON.stringify({ req_id: 2, ticks_history: SYMBOL, count: 1, end: "latest", style: "ticks" }));
       });
       ws.on("message", d => {
@@ -397,26 +397,60 @@ function ema(data, period) {
   return result;
 }
 
-// Wilder's Exponential Smoothing ATR(14)
-function calculateATR(candles, period = 14) {
-  if (!candles || candles.length === 0) return 0;
-  const trs = candles.map((c, i) => {
-    if (i === 0) return parseFloat(c.high) - parseFloat(c.low);
-    const ph = parseFloat(candles[i-1].close);
-    return Math.max(
-      parseFloat(c.high) - parseFloat(c.low),
-      Math.abs(parseFloat(c.high) - ph),
-      Math.abs(parseFloat(c.low) - ph)
-    );
-  });
-  if (trs.length <= period) {
-    return trs.reduce((a, b) => a + b, 0) / trs.length;
+// Parabolic SAR (Step: 0.010, Max: 0.070)
+function calculatePSAR(candles, step = 0.010, maxStep = 0.070) {
+  if (!candles || candles.length < 2) return [];
+  const sar = new Array(candles.length).fill(null);
+  
+  let isUp = parseFloat(candles[1].close) >= parseFloat(candles[0].close);
+  let af = step;
+  let ep = isUp ? parseFloat(candles[0].high) : parseFloat(candles[0].low);
+  let currentSar = isUp ? parseFloat(candles[0].low) : parseFloat(candles[0].high);
+  
+  sar[0] = currentSar;
+
+  for (let i = 1; i < candles.length; i++) {
+    const prevLow1 = parseFloat(candles[i - 1].low);
+    const prevLow2 = i >= 2 ? parseFloat(candles[i - 2].low) : prevLow1;
+    const prevHigh1 = parseFloat(candles[i - 1].high);
+    const prevHigh2 = i >= 2 ? parseFloat(candles[i - 2].high) : prevHigh1;
+    const currHigh = parseFloat(candles[i].high);
+    const currLow = parseFloat(candles[i].low);
+
+    let nextSar = currentSar + af * (ep - currentSar);
+
+    if (isUp) {
+      nextSar = Math.min(nextSar, prevLow1, prevLow2);
+      if (currLow < nextSar) {
+        isUp = false;
+        currentSar = ep;
+        ep = currLow;
+        af = step;
+      } else {
+        currentSar = nextSar;
+        if (currHigh > ep) {
+          ep = currHigh;
+          af = Math.min(af + step, maxStep);
+        }
+      }
+    } else {
+      nextSar = Math.max(nextSar, prevHigh1, prevHigh2);
+      if (currHigh > nextSar) {
+        isUp = true;
+        currentSar = ep;
+        ep = currHigh;
+        af = step;
+      } else {
+        currentSar = nextSar;
+        if (currLow < ep) {
+          ep = currLow;
+          af = Math.min(af + step, maxStep);
+        }
+      }
+    }
+    sar[i] = currentSar;
   }
-  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < trs.length; i++) {
-    atr = (atr * (period - 1) + trs[i]) / period;
-  }
-  return atr;
+  return sar;
 }
 
 function calcUnrealizedPnL(trade, currentPrice) {
@@ -531,7 +565,7 @@ function getBGAInfo(price) {
   return `BGA Zone (Near ${whole})`;
 }
 
-function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
+function calculateBgaTakeProfits(entry, direction, slDistance, d1Candles) {
   let step = 100;
   if (entry > 20000) step = 500;
   else if (entry > 10000) step = 200;
@@ -543,8 +577,7 @@ function calculateBgaTakeProfits(entry, direction, atr14, d1Candles) {
   const halfStep = step / 2;
   const baseWhole = Math.round(entry / step) * step;
   
-  // ENSURE MINIMUM 1:1 RR: TP1 distance must be at least equal to the Hard Stop Loss distance
-  const slDistance = atr14 * ATR_MULTIPLIER;
+  // ENSURE MINIMUM 1:1 RR: TP1 distance must be at least equal to the Stop Loss distance
   const minBuffer = Math.max(step * 0.50, slDistance);
 
   let fibMaxLimit = null;
@@ -641,6 +674,36 @@ async function runScanMode() {
     const pnl = calcUnrealizedPnL(openTrade, currentPrice);
     dbg(`Open trade PnL: ${pnl.toFixed(4)}`);
 
+    // ── Dynamic Live-Trailing Parabolic SAR Stop Loss ──
+    if (tradeData.candles && tradeData.candles.length >= 2) {
+      const psarValues = calculatePSAR(tradeData.candles, PSAR_STEP, PSAR_MAX);
+      const livePsar = psarValues[psarValues.length - 2]; // Closed M5 candle (no repainting)
+      const currentClose = parseFloat(tradeData.candles[tradeData.candles.length - 2].close);
+
+      if (livePsar != null) {
+        if (!openTrade.psarAligned) {
+          const nowAligned = openTrade.direction === "BUY" ? livePsar < currentClose : livePsar > currentClose;
+          if (nowAligned) {
+            openTrade.psarAligned = true;
+            openTrade.sl = openTrade.direction === "BUY"
+              ? Math.max(openTrade.sl, livePsar)
+              : Math.min(openTrade.sl, livePsar);
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+            dbg(`PSAR aligned for open trade. New SL: ${openTrade.sl.toFixed(4)}`);
+          }
+        } else {
+          const oldSl = openTrade.sl;
+          openTrade.sl = openTrade.direction === "BUY"
+            ? Math.max(openTrade.sl, livePsar)
+            : Math.min(openTrade.sl, livePsar);
+          if (openTrade.sl !== oldSl) {
+            fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+            dbg(`PSAR ratcheted SL from ${oldSl.toFixed(4)} to ${openTrade.sl.toFixed(4)}`);
+          }
+        }
+      }
+    }
+
     const closeWith = async (result, exitReason) => {
       let serverPnl = pnl;
       if (openTrade.contractId) {
@@ -687,7 +750,7 @@ async function runScanMode() {
       await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${finalResult}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
     };
 
-    // ── 1. Hard SL Price Check (Highest Priority per Spec) ──
+    // ── 1. Hard SL Price Check (Highest Priority per Spec - Dynamically Driven by PSAR) ──
     const slBreached = openTrade.direction === "BUY" ? currentPrice <= openTrade.sl : currentPrice >= openTrade.sl;
     if (slBreached) {
       await closeWith("LOSS", `Hard SL hit — price ${currentPrice.toFixed(4)} breached SL ${openTrade.sl.toFixed(4)}`);
@@ -701,8 +764,8 @@ async function runScanMode() {
       return;
     }
 
-    // ── 3. Breakeven Protection & Commission-Covered Pullback Exit ──
-    if (!openTrade.tp1Reached && !openTrade.breakevenSet && pnl >= BREAKEVEN_ACTIVATE_USD) {
+    // ── 3. Breakeven Protection & Commission-Covered Pullback Exit (Lifetime Floor) ──
+    if (!openTrade.breakevenSet && pnl >= BREAKEVEN_ACTIVATE_USD) {
       openTrade.breakevenSet = true;
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       await sendTelegram(`⚖️ *${REPO_LABEL} — Breakeven Armed*\nProfit reached $${BREAKEVEN_ACTIVATE_USD.toFixed(2)}. Price floor locked at entry (${openTrade.entry.toFixed(4)}).`);
@@ -715,7 +778,7 @@ async function runScanMode() {
       ? openTrade.entry * (1 + priceMoveFraction)
       : openTrade.entry * (1 - priceMoveFraction);
 
-    const breakevenHit = openTrade.breakevenSet && !openTrade.tp1Reached && (
+    const breakevenHit = openTrade.breakevenSet && (
       (openTrade.direction === "BUY" && currentPrice <= breakevenPrice) ||
       (openTrade.direction === "SELL" && currentPrice >= breakevenPrice)
     );
@@ -769,7 +832,8 @@ async function runScanMode() {
   }
 
   const isoTime = new Date(currentCandleEpoch * 1000).toISOString();
-  const atr14 = calculateATR(candles, ATR_PERIOD);
+  const psarValues = calculatePSAR(candles, PSAR_STEP, PSAR_MAX);
+  const currentPsar = psarValues[i];
 
   // 1. Evaluate Fresh H1 Crossover using EXPONENTIAL MOVING AVERAGE (EMA 50) over at least 250 H1 candles
   let h1FreshBuy = false;
@@ -999,18 +1063,42 @@ async function runScanMode() {
 
   if (signalTriggered) {
     const slDollars = parseFloat(STAKE_USD.toFixed(2));
-    const bgaTps = await calculateBgaTakeProfits(entry, direction, atr14, d1Candles);
+    let psarAligned = false;
+
+    // Check if PSAR is already aligned with trade direction at entry
+    if (direction === "BUY") {
+      if (currentPsar != null && currentPsar < entry) {
+        sl = currentPsar;
+        psarAligned = true;
+      } else {
+        // Unaligned fallback: exact price level for -$5.00 loss net of commission
+        const targetLoss = -5.00;
+        const requiredRawPnl = targetLoss + COMMISSION_USD;
+        const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
+        sl = entry * (1 + priceMoveFraction);
+        psarAligned = false;
+      }
+      risk = entry - sl;
+    } else {
+      if (currentPsar != null && currentPsar > entry) {
+        sl = currentPsar;
+        psarAligned = true;
+      } else {
+        // Unaligned fallback: exact price level for -$5.00 loss net of commission
+        const targetLoss = -5.00;
+        const requiredRawPnl = targetLoss + COMMISSION_USD;
+        const priceMoveFraction = requiredRawPnl / (STAKE_USD * MULTIPLIER);
+        sl = entry * (1 - priceMoveFraction);
+        psarAligned = false;
+      }
+      risk = sl - entry;
+    }
+
+    const slDistance = risk;
+    const bgaTps = await calculateBgaTakeProfits(entry, direction, slDistance, d1Candles);
     tp1 = bgaTps.tp1;
     tp2 = bgaTps.tp2;
     tp3 = bgaTps.tp3;
-
-    if (direction === "BUY") {
-      sl = entry - (atr14 * ATR_MULTIPLIER);
-      risk = entry - sl;
-    } else {
-      sl = entry + (atr14 * ATR_MULTIPLIER);
-      risk = sl - entry;
-    }
 
     const timeFormatted = new Date(currentCandleEpoch * 1000).toISOString().replace("T"," ").substring(0,19);
     const bgaTag = getBGAInfo(entry);
@@ -1019,7 +1107,9 @@ async function runScanMode() {
       ? 'PHASE B (Phase A window expired unfilled — fallback re-entry)'
       : `${entryType} (H1 EMA 50, ${PHASE_A_WINDOW_SECONDS/3600}h Phase A window)`;
 
-    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${setupLabel}\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
+    const psarLabel = psarAligned ? "(Live PSAR)" : "($5 Hard-Stop Floor — PSAR pending alignment)";
+
+    let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard, ${psarLabel})\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${setupLabel}\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
     try {
       const contractId = await executeTrade(direction);
@@ -1033,7 +1123,7 @@ async function runScanMode() {
         id: `${SYMBOL}-${isoTime}`, contractId, repo: REPO_LABEL, symbol: SYMBOL,
         direction, entry, sl, tp1, tp2, tp3, h1OpenAtEntry: null, tp1Reached: false,
         breakevenSet: false, peakProfit: null, rr: RISK_REWARD, entryType: entryType, 
-        openTime: timeFormatted, closeTime: null, result: null
+        psarAligned, openTime: timeFormatted, closeTime: null, result: null
       });
       fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
     } catch (execErr) {
