@@ -213,7 +213,7 @@
     "symbol": "1HZ75V",
     "direction": "SELL",
     "entry": 7233.8,
-    "sl": 7374.135720000001,
+    "sl": 7306.41,
     "tp1": 7000,
     "tp2": 6950,
     "tp3": 6900,
@@ -223,7 +223,7 @@
     "peakProfit": null,
     "rr": 1.5,
     "entryType": "PHASE_B_NO_PRIOR_A",
-    "psarAligned": false,
+    "psarAligned": true,
     "openTime": "2026-08-19 18:45:00",
     "closeTime": null,
     "result": null
