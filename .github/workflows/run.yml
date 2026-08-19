@@ -25,6 +25,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -56,5 +57,22 @@ jobs:
           git add state.json trades.json
           git diff --cached --quiet && echo "No changes" && exit 0
           git commit -m "Auto update bot state and trade logs"
-          git pull --rebase -X ours origin main
-          git push origin HEAD:main
+          for i in 1 2 3; do
+            git pull --rebase -X ours origin main && git push origin HEAD:main && exit 0
+            echo "Git push attempt $i failed. Retrying in 5s..."
+            sleep 5
+          done
+          exit 1
+
+      - name: Alert Telegram on Workflow Failure
+        if: failure()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" \
+              -d text="⚠️ *Workflow Failure Alert* — A step failed during execution on repository. Check GitHub Actions logs." \
+              -d parse_mode="Markdown"
+          fi
