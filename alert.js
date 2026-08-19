@@ -46,7 +46,7 @@ const M5 = 5 * 60;
 const H1 = 60 * 60;
 const D1 = 24 * 60 * 60;
 
-const PHASE_A_WINDOW_SECONDS = 2 * 60 * 60; // Strict 2-hour window for Phase A after H1 fresh cross
+const PHASE_A_WINDOW_SECONDS = 2.5 * 60 * 60; // Strict 2h 30m window (9,000 seconds) for Phase A after H1 fresh cross
 
 const DEBUG = process.env.DEBUG === "true";
 function dbg(...a) { if (DEBUG) console.log("[DBG]", ...a); }
