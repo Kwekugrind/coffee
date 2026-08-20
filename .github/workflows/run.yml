@@ -15,7 +15,7 @@ on:
     - cron: '*/5 * * * *'
 
 concurrency:
-  group: deriv-bot-execution
+  group: deriv-bot-${{ github.repository }}
   cancel-in-progress: false
 
 permissions:
@@ -34,6 +34,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'
 
       - name: Install Dependencies
         run: npm install
@@ -65,11 +66,8 @@ jobs:
             echo "Git push attempt $i failed. Retrying in 5s..."
             sleep 5
           done
-          # Git-push-failure visibility alert — narrow follow-up fix
-          # Message built as a single ANSI-C quoted variable ($'...') so that
-          # embedded \n newlines stay on ONE physical line in this YAML block
-          # scalar. Do not reformat this back into a raw multi-line string —
-          # that breaks YAML block-scalar indentation and will fail to parse.
+
+          # Git-push-failure visibility alert
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
             MSG=$'⚠️ *Git Persistence Alert — ${{ github.repository }}*\n\nGit push failed after 3 attempts. Local `state.json` and `trades.json` could not be synced back to GitHub main.\n\n• *Impact:* State and trade logs may be out of sync with actions executed on Deriv during this run.\n• *Self-Correction:* Server-truth reconciliation in alert.js will attempt auto-recovery on the next run, but verify manually if this persists.'
             curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
@@ -88,6 +86,6 @@ jobs:
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TG_CHAT_ID}" \
-              -d text="⚠️ *Workflow Failure Alert* — A step failed during execution on repository. Check GitHub Actions logs." \
+              -d text="⚠️ *Workflow Failure Alert — ${{ github.repository }}*\n\nA step failed during execution. Check GitHub Actions logs." \
               -d parse_mode="Markdown"
           fi
