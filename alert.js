@@ -220,8 +220,8 @@ function openWS() {
   });
 }
 
-// Resilient 429 RateLimit Exponential Backoff with Jitter
-async function withRetry(fn, retries = 3, delay = 6000) {
+// Resilient RateLimit Backoff
+async function withRetry(fn, retries = 3, delay = 4000) {
   for (let i = 0; i < retries; i++) {
     try {
       return await fn();
@@ -314,7 +314,7 @@ async function getDerivOTP(accountId) {
   return json.data.url;
 }
 
-// ── Authenticated Server Contract Status (Fresh OTP per request) ──
+// ── Authenticated Server Contract Status ──
 async function getServerContractStatus(contractId, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -351,10 +351,10 @@ async function getServerContractStatus(contractId, preAccountId = null) {
       };
     }
     return null;
-  }, 3, 4000);
+  }, 3, 3000);
 }
 
-// ── Authenticated Portfolio Fetcher (Fresh OTP per request) ──
+// ── Authenticated Portfolio Fetcher ──
 async function getOpenPortfolio(preAccountId = null) {
   if (!DERIV_TOKEN || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -375,10 +375,10 @@ async function getOpenPortfolio(preAccountId = null) {
       throw new Error(`getOpenPortfolio error: ${JSON.stringify(data.error || data.errors)}`);
     }
     return data.portfolio?.contracts || [];
-  }, 3, 4000);
+  }, 3, 3000);
 }
 
-// ── Authenticated Profit Table Lookup (Fresh OTP per request) ──
+// ── Authenticated Profit Table Lookup ──
 async function getContractProfitFromHistory(contractId, approxOpenEpoch, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -413,10 +413,10 @@ async function getContractProfitFromHistory(contractId, approxOpenEpoch, preAcco
       : (parseFloat(match.sell_price) - parseFloat(match.buy_price));
 
     return { profit, sellTime: match.sell_time };
-  }, 3, 4000);
+  }, 3, 3000);
 }
 
-// ── Authenticated Broker-Side Stop Loss Update ──
+// ── Authenticated Broker-Side Stop Loss Update (Precision Check) ──
 async function updateContractStopLoss(contractId, slAmount, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return false;
   return withRetry(async () => {
@@ -440,30 +440,35 @@ async function updateContractStopLoss(contractId, slAmount, preAccountId = null)
     const data = await response.json();
     console.log(`[${REPO_LABEL}] contract_update RAW response for ${contractId}:`, JSON.stringify(data));
 
-    const errStr = String(JSON.stringify(data));
-    if (errStr.includes("429") || errStr.includes("RateLimit")) {
-      throw new Error(`429/RateLimit on contract_update: ${errStr}`);
-    }
+    // Check ONLY the actual error object, never the success body
     if (data.error || data.errors) {
-      dbg(`[${REPO_LABEL}] contract_update rejected (non-retryable): ${JSON.stringify(data.error || data.errors)}`);
+      const errObj = data.error || data.errors;
+      const errCode = errObj?.code || "";
+      const errMsg = errObj?.message || JSON.stringify(errObj);
+      const isRateLimit = errCode === "RateLimit" || errObj?.status === 429 || String(errMsg).toLowerCase().includes("rate limit");
+
+      if (isRateLimit) {
+        throw new Error(`429/RateLimit on contract_update: ${errMsg}`);
+      }
+
+      dbg(`[${REPO_LABEL}] contract_update rejected: ${errMsg}`);
       return false;
     }
 
     const cu = data.contract_update;
-    const echoedSl =
-      cu?.limit_order?.stop_loss?.order_amount ??
-      cu?.limit_order?.stop_loss ??
-      cu?.stop_loss ??
-      null;
-
-    if (cu && (echoedSl != null || Object.keys(cu).length > 0)) {
-      dbg(`[${REPO_LABEL}] Broker-side Stop Loss update ACK for contract ${contractId} (requested $${slAmount.toFixed(2)}, echoed: ${echoedSl})`);
+    if (cu && cu.stop_loss) {
+      const echoedSl = cu.stop_loss.order_amount ?? cu.stop_loss.display_order_amount ?? slAmount;
+      dbg(`[${REPO_LABEL}] Broker-side Stop Loss update ACK for contract ${contractId} (requested $${slAmount.toFixed(2)}, broker: ${echoedSl})`);
       return true;
     }
 
-    dbg(`[${REPO_LABEL}] contract_update returned no error but unrecognized success shape — treating as failure this cycle.`);
+    if (cu && Object.keys(cu).length > 0) {
+      return true;
+    }
+
+    dbg(`[${REPO_LABEL}] contract_update unrecognized success shape — treating as failure this cycle.`);
     return false;
-  }, 2, 3000);
+  }, 2, 2000);
 }
 
 // ── Idempotent Trade Execution ──
@@ -523,13 +528,17 @@ async function executeTrade(direction) {
       console.log("📨 Proxy response:", JSON.stringify(data));
 
       if (data.error || data.errors) {
-        const errStr = JSON.stringify(data.error || data.errors);
-        if (errStr.includes("429") || errStr.includes("RateLimit")) {
+        const errObj = data.error || data.errors;
+        const errCode = errObj?.code || "";
+        const errMsg = errObj?.message || JSON.stringify(errObj);
+        const isRateLimit = errCode === "RateLimit" || errObj?.status === 429 || String(errMsg).toLowerCase().includes("rate limit");
+
+        if (isRateLimit) {
           console.warn(`429 RateLimit on buy. Waiting before retry...`);
-          await sleep(6000 * attempt);
+          await sleep(4000 * attempt);
           continue;
         }
-        throw new Error(`Broker error: ${errStr}`);
+        throw new Error(`Broker error: ${errMsg}`);
       }
 
       const contractId = data.buy?.contract_id;
@@ -541,13 +550,13 @@ async function executeTrade(direction) {
     } catch (err) {
       console.warn(`[${REPO_LABEL}] Buy attempt ${attempt} network error: ${err.message}.`);
       if (attempt === 3) throw err;
-      await sleep(4000 * attempt);
+      await sleep(3000 * attempt);
     }
   }
   return null;
 }
 
-// ── Resilient Contract Closing (Increased backoff & fresh OTP) ──
+// ── Resilient Contract Closing (Precision Error Check) ──
 async function closeContract(contractId, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -562,14 +571,23 @@ async function closeContract(contractId, preAccountId = null) {
     const data = await response.json();
     console.log("📨 Close response:", JSON.stringify(data));
 
-    const errCode = data.error?.code || data.errors?.code;
-    const errStr = String(JSON.stringify(data));
+    if (data.error || data.errors) {
+      const errObj = data.error || data.errors;
+      const errCode = errObj?.code || "";
+      const errMsg = errObj?.message || JSON.stringify(errObj);
 
-    if (errCode !== "ContractNotFound" && (data.error || data.errors || errStr.includes("429") || errStr.includes("RateLimit"))) {
-      throw new Error(`429/RateLimit/Error: ${errStr}`);
+      if (errCode === "ContractNotFound" || String(errMsg).includes("not found among your open positions")) {
+        return { error: { code: "ContractNotFound", message: errMsg } };
+      }
+
+      const isRateLimit = errCode === "RateLimit" || errObj?.status === 429 || String(errMsg).toLowerCase().includes("rate limit");
+      if (isRateLimit) {
+        throw new Error(`429/RateLimit on close: ${errMsg}`);
+      }
+      throw new Error(`Close error: ${errMsg}`);
     }
     return data;
-  }, 4, 6000);
+  }, 4, 4000);
 }
 
 // ==================== TECHNICAL ANALYSIS & INDICATORS ====================
@@ -895,7 +913,7 @@ async function runScanMode() {
   }
 
   for (const liveContract of allLiveContracts) {
-    await sleep(500); // 500ms pacing between multiple adoptions
+    await sleep(500);
     const liveStartTime = liveContract.date_start ? liveContract.date_start * 1000 : null;
     const expectedType = liveContract.contract_type === "MULTUP" ? "BUY" : "SELL";
 
@@ -1010,7 +1028,7 @@ async function runScanMode() {
     const currentPrice = tradeData.price;
 
     for (const openTrade of openTradesList) {
-      await sleep(1500); // 1.5s throttling delay per open contract
+      await sleep(1500);
       let pnl = calcUnrealizedPnL(openTrade, currentPrice);
       let usingServerTruthPnl = false;
 
@@ -1165,7 +1183,7 @@ async function runScanMode() {
         await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${finalResult}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
       };
 
-      // ── 1. Priority Exit Checks (If an exit is triggered, do NOT waste an SL update call!) ──
+      // ── 1. Priority Exit Checks ──
       const slBreached = openTrade.direction === "BUY" ? currentPrice <= openTrade.sl : currentPrice >= openTrade.sl;
       if (psarReversalExit || slBreached) {
         const reason = psarReversalExit ? psarExitReason : `Hard SL hit — price ${currentPrice.toFixed(4)} breached SL ${openTrade.sl.toFixed(4)}`;
@@ -1219,7 +1237,7 @@ async function runScanMode() {
         }
       }
 
-      // ── 2. If Trade Remains Active: Push Broker Stop Loss Updates (Throttled) ──
+      // ── 2. If Trade Remains Active: Push Broker Stop Loss Updates ──
       if (openTrade.contractId && openTrade.psarAligned && !openTrade.profitLockPhase) {
         if (isLossSide && targetNewSl != null) {
           const currentBrokerSl = openTrade.brokerSlAmount || STAKE_USD;
