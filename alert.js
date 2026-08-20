@@ -28,7 +28,8 @@ const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const R
 const TRADING_SYMBOL = SYMBOL;
 const STAKE_USD = 5;
 const RISK_REWARD = 1.5;
-const SAFETY_TP_USD = 8.00; // $8 flat profit insurance ceiling on broker side
+const TARGET_TP1_USD = 4.00; // Target ~$4.00 profit for TP1 (arms 50% trail)
+const SAFETY_TP_USD = 8.00;  // $8.00 flat profit insurance ceiling on broker side
 const BREAKEVEN_ACTIVATE_USD = 2.00; // Move SL to entry once profit hits $2.00
 const CATASTROPHIC_PNL_FLOOR = -5.50; // Server-truth catastrophic loss floor
 const PSAR_STEP = 0.010; // Parabolic SAR acceleration factor step
@@ -220,7 +221,6 @@ function openWS() {
   });
 }
 
-// Resilient RateLimit Backoff
 async function withRetry(fn, retries = 3, delay = 4000) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -314,7 +314,7 @@ async function getDerivOTP(accountId) {
   return json.data.url;
 }
 
-// ── Authenticated Server Contract Status ──
+// ── Authenticated Server Contract Status (Fresh OTP per request) ──
 async function getServerContractStatus(contractId, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -354,7 +354,7 @@ async function getServerContractStatus(contractId, preAccountId = null) {
   }, 3, 3000);
 }
 
-// ── Authenticated Portfolio Fetcher ──
+// ── Authenticated Portfolio Fetcher (Fresh OTP per request) ──
 async function getOpenPortfolio(preAccountId = null) {
   if (!DERIV_TOKEN || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -378,7 +378,7 @@ async function getOpenPortfolio(preAccountId = null) {
   }, 3, 3000);
 }
 
-// ── Authenticated Profit Table Lookup ──
+// ── Authenticated Profit Table Lookup (Fresh OTP per request) ──
 async function getContractProfitFromHistory(contractId, approxOpenEpoch, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -440,7 +440,6 @@ async function updateContractStopLoss(contractId, slAmount, preAccountId = null)
     const data = await response.json();
     console.log(`[${REPO_LABEL}] contract_update RAW response for ${contractId}:`, JSON.stringify(data));
 
-    // Check ONLY the actual error object, never the success body
     if (data.error || data.errors) {
       const errObj = data.error || data.errors;
       const errCode = errObj?.code || "";
@@ -556,7 +555,7 @@ async function executeTrade(direction) {
   return null;
 }
 
-// ── Resilient Contract Closing (Precision Error Check) ──
+// ── Resilient Contract Closing ──
 async function closeContract(contractId, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -788,6 +787,7 @@ function getBGAInfo(price) {
   return `BGA Zone (Near ${whole})`;
 }
 
+// ── $4.00 Targeted TP1 BGA Snapping Algorithm ──
 function calculateBgaTakeProfits(entry, direction, slDistance, d1Candles) {
   let step = 100;
   if (entry > 20000) step = 500;
@@ -799,7 +799,16 @@ function calculateBgaTakeProfits(entry, direction, slDistance, d1Candles) {
 
   const halfStep = step / 2;
   const baseWhole = Math.round(entry / step) * step;
-  const minBuffer = Math.max(step * 0.50, slDistance);
+
+  // 1. Calculate the ideal price move to produce exactly ~$4.00 profit
+  const requiredRawPnlTp1 = TARGET_TP1_USD + COMMISSION_USD;
+  const tp1PriceMove = (requiredRawPnlTp1 / (STAKE_USD * MULTIPLIER)) * entry;
+  const idealTp1Price = direction === "BUY" ? entry + tp1PriceMove : entry - tp1PriceMove;
+
+  // 2. Calculate the price cap for the $8.00 Ultimate Take-Profit ceiling
+  const requiredRawPnlTp2 = SAFETY_TP_USD + COMMISSION_USD;
+  const tp2PriceMove = (requiredRawPnlTp2 / (STAKE_USD * MULTIPLIER)) * entry;
+  const idealTp2Price = direction === "BUY" ? entry + tp2PriceMove : entry - tp2PriceMove;
 
   let fibMaxLimit = null;
   if (d1Candles && d1Candles.length >= 2) {
@@ -808,71 +817,68 @@ function calculateBgaTakeProfits(entry, direction, slDistance, d1Candles) {
     const prevLow = parseFloat(prevDay.low);
     const prevRange = prevHigh - prevLow;
     if (prevRange > 0) {
-      if (direction === "BUY") {
-        fibMaxLimit = prevHigh + (prevRange * 2.618);
-      } else {
-        fibMaxLimit = prevLow - (prevRange * 2.618);
-      }
+      fibMaxLimit = direction === "BUY" ? prevHigh + (prevRange * 2.618) : prevLow - (prevRange * 2.618);
     }
   }
 
+  // Generate grid levels around the entry
   const allLevels = [];
-  for (let offset = -10 * step; offset <= 15 * step; offset += halfStep) {
+  for (let offset = -20 * step; offset <= 25 * step; offset += halfStep) {
     allLevels.push(baseWhole + offset);
   }
 
   if (direction === "BUY") {
-    let w = baseWhole;
-    if (w <= entry) w += step;
-    let validTp1 = null;
-    while (!validTp1 && w <= entry + (step * 5)) {
-      if ((w - entry) >= minBuffer) {
-        validTp1 = w;
-      }
-      w += step;
+    // Find all BGA levels above entry
+    const validLevels = allLevels.filter(l => l > entry);
+
+    // Find the level closest to our ideal $4.00 profit price
+    validLevels.sort((a, b) => Math.abs(a - idealTp1Price) - Math.abs(b - idealTp1Price));
+    let tp1 = validLevels[0] || (baseWhole + step);
+
+    // Ensure TP1 is strictly below the $8.00 limit
+    if (tp1 >= idealTp2Price) {
+      const subCeilingLevels = validLevels.filter(l => l < idealTp2Price);
+      tp1 = subCeilingLevels[0] || entry + (tp1PriceMove * 0.9);
     }
-    const tp1 = validTp1 || (baseWhole + step);
 
-    let futureLevels = allLevels.filter(l => l > tp1).sort((a, b) => a - b);
-    if (fibMaxLimit && fibMaxLimit > tp1) futureLevels = futureLevels.filter(l => l <= fibMaxLimit);
-
-    let tp2 = futureLevels[0] || (tp1 + halfStep);
-    let tp3 = futureLevels[1] || (tp1 + step);
-
-    if (tp2 <= tp1) tp2 = tp1 + halfStep;
-    if (tp3 <= tp2) tp3 = tp2 + halfStep;
+    // TP2 targets the $8.00 zone, clamped by D1 Fib 261.8%
+    let futureLevels = allLevels.filter(l => l > tp1).sort((a, b) => Math.abs(a - idealTp2Price) - Math.abs(b - idealTp2Price));
+    let tp2 = futureLevels[0] || tp1 + halfStep;
+    let tp3 = tp2 + halfStep;
 
     if (fibMaxLimit && fibMaxLimit > tp1) {
       tp2 = Math.min(tp2, fibMaxLimit);
       tp3 = Math.min(tp3, fibMaxLimit);
     }
+    if (tp2 <= tp1) tp2 = tp1 + halfStep;
+    if (tp3 <= tp2) tp3 = tp2 + halfStep;
 
     return { tp1, tp2, tp3 };
   } else {
-    let w = baseWhole;
-    if (w >= entry) w -= step;
-    let validTp1 = null;
-    while (!validTp1 && w >= entry - (step * 5)) {
-      if ((entry - w) >= minBuffer) {
-        validTp1 = w;
-      }
-      w -= step;
+    // Find all BGA levels below entry
+    const validLevels = allLevels.filter(l => l < entry);
+
+    // Find the level closest to our ideal $4.00 profit price
+    validLevels.sort((a, b) => Math.abs(a - idealTp1Price) - Math.abs(b - idealTp1Price));
+    let tp1 = validLevels[0] || (baseWhole - step);
+
+    // Ensure TP1 is strictly above the $8.00 limit (for SELL, $8 profit is a lower price)
+    if (tp1 <= idealTp2Price) {
+      const subCeilingLevels = validLevels.filter(l => l > idealTp2Price);
+      tp1 = subCeilingLevels[0] || entry - (tp1PriceMove * 0.9);
     }
-    const tp1 = validTp1 || (baseWhole - step);
 
-    let futureLevels = allLevels.filter(l => l < tp1).sort((a, b) => b - a);
-    if (fibMaxLimit && fibMaxLimit < tp1) futureLevels = futureLevels.filter(l => l >= fibMaxLimit);
-
-    let tp2 = futureLevels[0] || (tp1 - halfStep);
-    let tp3 = futureLevels[1] || (tp1 - step);
-
-    if (tp2 >= tp1) tp2 = tp1 - halfStep;
-    if (tp3 >= tp2) tp3 = tp2 - halfStep;
+    // TP2 targets the $8.00 zone, clamped by D1 Fib 261.8%
+    let futureLevels = allLevels.filter(l => l < tp1).sort((a, b) => Math.abs(a - idealTp2Price) - Math.abs(b - idealTp2Price));
+    let tp2 = futureLevels[0] || tp1 - halfStep;
+    let tp3 = tp2 - halfStep;
 
     if (fibMaxLimit && fibMaxLimit < tp1) {
       tp2 = Math.max(tp2, fibMaxLimit);
       tp3 = Math.max(tp3, fibMaxLimit);
     }
+    if (tp2 >= tp1) tp2 = tp1 - halfStep;
+    if (tp3 >= tp2) tp3 = tp2 - halfStep;
 
     return { tp1, tp2, tp3 };
   }
