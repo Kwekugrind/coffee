@@ -312,12 +312,12 @@ async function getDerivOTP(accountId) {
   return json.data.url;
 }
 
-// ── Authenticated Server Contract Status ──
-async function getServerContractStatus(contractId, preAccountId = null, preWsUrl = null) {
+// ── Authenticated Server Contract Status (Fetches a fresh OTP on every attempt) ──
+async function getServerContractStatus(contractId, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
     const accountId = preAccountId || await getDerivAccountId();
-    const wsUrl = preWsUrl || await getDerivOTP(accountId);
+    const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
     const response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
@@ -352,12 +352,12 @@ async function getServerContractStatus(contractId, preAccountId = null, preWsUrl
   }, 3, 3000);
 }
 
-// ── Authenticated Portfolio Fetcher ──
-async function getOpenPortfolio() {
+// ── Authenticated Portfolio Fetcher (Fetches a fresh OTP on every attempt) ──
+async function getOpenPortfolio(preAccountId = null) {
   if (!DERIV_TOKEN || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
-    const accountId = await getDerivAccountId();
-    const wsUrl = await getDerivOTP(accountId);
+    const accountId = preAccountId || await getDerivAccountId();
+    const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
     const response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
@@ -376,12 +376,12 @@ async function getOpenPortfolio() {
   }, 3, 3000);
 }
 
-// ── Authenticated Profit Table Lookup ──
-async function getContractProfitFromHistory(contractId, approxOpenEpoch) {
+// ── Authenticated Profit Table Lookup (Fetches a fresh OTP on every attempt) ──
+async function getContractProfitFromHistory(contractId, approxOpenEpoch, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
-    const accountId = await getDerivAccountId();
-    const wsUrl = await getDerivOTP(accountId);
+    const accountId = preAccountId || await getDerivAccountId();
+    const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
     const response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
@@ -414,12 +414,12 @@ async function getContractProfitFromHistory(contractId, approxOpenEpoch) {
   }, 3, 3000);
 }
 
-// ── Authenticated Broker-Side Stop Loss Update ──
-async function updateContractStopLoss(contractId, slAmount, preAccountId = null, preWsUrl = null) {
+// ── Authenticated Broker-Side Stop Loss Update (Fetches a fresh OTP on every attempt) ──
+async function updateContractStopLoss(contractId, slAmount, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return false;
   return withRetry(async () => {
     const accountId = preAccountId || await getDerivAccountId();
-    const wsUrl = preWsUrl || await getDerivOTP(accountId);
+    const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
     const response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
@@ -464,7 +464,7 @@ async function updateContractStopLoss(contractId, slAmount, preAccountId = null,
   }, 2, 2000);
 }
 
-// ── Idempotent Trade Execution ──
+// ── Idempotent Trade Execution (Fetches a fresh OTP on every attempt) ──
 async function executeTrade(direction) {
   if (!DERIV_TOKEN || !DERIV_APP_ID || !PROXY_URL || !PROXY_SECRET) return null;
   const startTimeEpoch = Math.floor(Date.now() / 1000);
@@ -493,7 +493,7 @@ async function executeTrade(direction) {
     try {
       console.log(`🔄 Sending ${direction} trade via Cloudflare proxy (attempt ${attempt}/3)...`);
       const accountId = await getDerivAccountId();
-      const wsUrl = await getDerivOTP(accountId);
+      const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
       const slDollars = parseFloat(STAKE_USD.toFixed(2));
       const tpValue = typeof SAFETY_TP_USD !== 'undefined' ? SAFETY_TP_USD : 8.00;
       const params = {
@@ -545,13 +545,13 @@ async function executeTrade(direction) {
   return null;
 }
 
-// ── Resilient Contract Closing ──
-async function closeContract(contractId, preAccountId = null, preWsUrl = null) {
+// ── Resilient Contract Closing (Fetches a fresh OTP on every attempt) ──
+async function closeContract(contractId, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
     console.log(`🔄 Closing contract ${contractId} via proxy...`);
     const accountId = preAccountId || await getDerivAccountId();
-    const wsUrl = preWsUrl || await getDerivOTP(accountId);
+    const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
     const response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
@@ -864,19 +864,18 @@ async function runScanMode() {
   let trades = [];
   try { trades = JSON.parse(fs.readFileSync("trades.json")); } catch {}
 
-  // Pre-fetch account/OTP credentials once for this scan cycle
-  let cachedAccountId = null, cachedWsUrl = null;
+  // Pre-fetch account ID once for this scan cycle (Account ID is static and safe to cache)
+  let cachedAccountId = null;
   try {
     cachedAccountId = await getDerivAccountId();
-    cachedWsUrl = await getDerivOTP(cachedAccountId);
   } catch (e) {
-    dbg(`[${REPO_LABEL}] Failed to pre-fetch account/OTP for this scan cycle: ${e.message}`);
+    dbg(`[${REPO_LABEL}] Failed to pre-fetch account ID for this scan cycle: ${e.message}`);
   }
 
   // ── STEP 0: SERVER-TRUTH BROKER PORTFOLIO RECONCILIATION ──
   let allLiveContracts = [];
   try {
-    const allPortfolio = await getOpenPortfolio();
+    const allPortfolio = await getOpenPortfolio(cachedAccountId);
     if (!Array.isArray(allPortfolio)) {
       console.warn(`[${REPO_LABEL}] Warning: getOpenPortfolio returned non-array. Aborting scan to prevent duplicates.`);
       return;
@@ -918,7 +917,7 @@ async function runScanMode() {
       // Fetch true spot price (never use buy_price $5 stake)
       let entryPrice = 0;
       try {
-        const poc = await getServerContractStatus(liveContract.contract_id, cachedAccountId, cachedWsUrl);
+        const poc = await getServerContractStatus(liveContract.contract_id, cachedAccountId);
         if (poc && (poc.entry_spot || poc.current_spot)) {
           entryPrice = parseFloat(poc.entry_spot || poc.current_spot);
         }
@@ -971,7 +970,7 @@ async function runScanMode() {
         let recovered = null;
         try {
           const openEpoch = t.openTime ? Math.floor(new Date(t.openTime).getTime() / 1000) : undefined;
-          recovered = await getContractProfitFromHistory(t.contractId, openEpoch);
+          recovered = await getContractProfitFromHistory(t.contractId, openEpoch, cachedAccountId);
         } catch (histErr) {
           console.warn(`[${REPO_LABEL}] profit_table lookup failed: ${histErr.message}`);
         }
@@ -1015,11 +1014,11 @@ async function runScanMode() {
 
       if (openTrade.contractId) {
         try {
-          const serverStatus = await getServerContractStatus(openTrade.contractId, cachedAccountId, cachedWsUrl);
+          const serverStatus = await getServerContractStatus(openTrade.contractId, cachedAccountId);
 
           if (serverStatus && serverStatus.error === "ContractNotFound") {
             dbg(`ContractNotFound for ${openTrade.contractId}. Cross-checking active portfolio...`);
-            const activeContracts = await getOpenPortfolio();
+            const activeContracts = await getOpenPortfolio(cachedAccountId);
             const stillActive = activeContracts?.some(c => String(c.contract_id) === String(openTrade.contractId));
 
             if (stillActive) {
@@ -1078,7 +1077,7 @@ async function runScanMode() {
                 const currentBrokerSl = openTrade.brokerSlAmount || STAKE_USD;
 
                 if (newSlAmount < currentBrokerSl - 0.05) {
-                  const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId, cachedWsUrl);
+                  const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId);
                   if (updated) {
                     openTrade.brokerSlAmount = newSlAmount;
                     dbg(`[${REPO_LABEL}] Pushed tighter broker SL: $${newSlAmount.toFixed(2)} for BUY contract ${openTrade.contractId}`);
@@ -1094,7 +1093,7 @@ async function runScanMode() {
 
                 for (const candidate of candidateFloors) {
                   if ((openTrade.brokerSlAmount || STAKE_USD) <= candidate) break;
-                  const updated = await updateContractStopLoss(openTrade.contractId, candidate, cachedAccountId, cachedWsUrl);
+                  const updated = await updateContractStopLoss(openTrade.contractId, candidate, cachedAccountId);
                   if (updated) {
                     openTrade.profitLockPhase = true;
                     openTrade.brokerSlAmount = candidate;
@@ -1119,7 +1118,7 @@ async function runScanMode() {
                   const rawLoss = (((openTrade.entry - livePsar) / openTrade.entry) * STAKE_USD * MULTIPLIER) + COMMISSION_USD;
                   const newSlAmount = parseFloat(Math.min(STAKE_USD, Math.max(0.10, rawLoss)).toFixed(2));
                   if (newSlAmount < (openTrade.brokerSlAmount || STAKE_USD) - 0.05) {
-                    const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId, cachedWsUrl);
+                    const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId);
                     if (updated) openTrade.brokerSlAmount = newSlAmount;
                   }
                 }
@@ -1138,7 +1137,7 @@ async function runScanMode() {
                 const currentBrokerSl = openTrade.brokerSlAmount || STAKE_USD;
 
                 if (newSlAmount < currentBrokerSl - 0.05) {
-                  const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId, cachedWsUrl);
+                  const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId);
                   if (updated) {
                     openTrade.brokerSlAmount = newSlAmount;
                     dbg(`[${REPO_LABEL}] Pushed tighter broker SL: $${newSlAmount.toFixed(2)} for SELL contract ${openTrade.contractId}`);
@@ -1154,7 +1153,7 @@ async function runScanMode() {
 
                 for (const candidate of candidateFloors) {
                   if ((openTrade.brokerSlAmount || STAKE_USD) <= candidate) break;
-                  const updated = await updateContractStopLoss(openTrade.contractId, candidate, cachedAccountId, cachedWsUrl);
+                  const updated = await updateContractStopLoss(openTrade.contractId, candidate, cachedAccountId);
                   if (updated) {
                     openTrade.profitLockPhase = true;
                     openTrade.brokerSlAmount = candidate;
@@ -1179,7 +1178,7 @@ async function runScanMode() {
                   const rawLoss = (((livePsar - openTrade.entry) / openTrade.entry) * STAKE_USD * MULTIPLIER) + COMMISSION_USD;
                   const newSlAmount = parseFloat(Math.min(STAKE_USD, Math.max(0.10, rawLoss)).toFixed(2));
                   if (newSlAmount < (openTrade.brokerSlAmount || STAKE_USD) - 0.05) {
-                    const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId, cachedWsUrl);
+                    const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId);
                     if (updated) openTrade.brokerSlAmount = newSlAmount;
                   }
                 }
@@ -1197,7 +1196,7 @@ async function runScanMode() {
         let resultSource = "estimated_fallback";
         if (openTrade.contractId) {
           try {
-            const closeRes = await closeContract(openTrade.contractId, cachedAccountId, cachedWsUrl);
+            const closeRes = await closeContract(openTrade.contractId, cachedAccountId);
             if (!closeRes || closeRes.error) {
               const errCode = closeRes.error?.code;
               const errDesc = closeRes.error?.message || JSON.stringify(closeRes.error);
@@ -1562,7 +1561,7 @@ async function runScanMode() {
     // ── Pre-Execution Portfolio Check with Strict Abort ──
     console.log(`[${REPO_LABEL}] Signal triggered for ${direction}. Performing immediate pre-execution portfolio check...`);
     try {
-      const preCheckPortfolio = await getOpenPortfolio();
+      const preCheckPortfolio = await getOpenPortfolio(cachedAccountId);
       if (!Array.isArray(preCheckPortfolio)) {
         throw new Error("getOpenPortfolio returned non-array response");
       }
@@ -1621,7 +1620,6 @@ async function runScanMode() {
 
     let message = `🚨 *${SYMBOL_NAME.toUpperCase()} CONFIRMED SIGNAL* 🚨\n\nDirection: ${direction}\nRepo: ${REPO_LABEL}\nTimeframe: M5\n\n📍 Entry: ${entry.toFixed(4)}\n🛑 SL: ${sl.toFixed(4)} ($${slDollars} hard, ${psarLabel})\n🎯 TP1: ${tp1.toFixed(4)} (BGA Whole)\n🎯 TP2 (Ultimate TP): ${tp2.toFixed(4)} (BGA)\n🎯 TP3: ${tp3.toFixed(4)} (reference)\n\n💰 Stake: $${STAKE_USD} | Hard SL: $${slDollars}\n⚡ Setup: ${setupLabel}\n️ Confluence: ${bgaTag}\n━━━━━━━━━━━━━━━━━━━━\n⏰ Time (UTC): ${timeFormatted}\n\n💡 To close manually: send \`/close win\` or \`/close loss\` in this chat`;
 
-    // Persist candle progress immediately before dispatch
     state.lastProcessedEpoch = currentCandleEpoch;
     fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
 
