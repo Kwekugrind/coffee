@@ -11,10 +11,10 @@ import fs from "fs";
 // const SYMBOL = "R_50"; const SYMBOL_NAME = "Volatility 50 Index"; const REPO_LABEL = "OmniSight (V50)"; const MULTIPLIER = 80; const COMMISSION_USD = 0.16;
 
 // --- 3. Lery's Alerts (Demo) ---
-// const SYMBOL = "R_75"; const SYMBOL_NAME = "Volatility 75 Index"; const REPO_LABEL = "Lery's Alerts (V75 Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
+const SYMBOL = "R_75"; const SYMBOL_NAME = "Volatility 75 Index"; const REPO_LABEL = "Lery's Alerts (V75 Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
 
 // --- 4. Coffee (Demo) ---
-const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const REPO_LABEL = "Coffee (V75-1s Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
+// const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const REPO_LABEL = "Coffee (V75-1s Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
 
 // --- 5. Milk (Demo) ---
 // const SYMBOL = "R_100"; const SYMBOL_NAME = "Volatility 100 Index"; const REPO_LABEL = "Milk (V100 Demo)"; const MULTIPLIER = 40; const COMMISSION_USD = 0.15;
@@ -51,8 +51,9 @@ const PHASE_A_WINDOW_SECONDS = 2.5 * 60 * 60; // 2h 30m window for Phase A after
 
 const DEBUG = process.env.DEBUG === "true";
 function dbg(...a) { if (DEBUG) console.log("[DBG]", ...a); }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Universal Symbol Extractor (Prevents schema mismatches between API v2 and v3)
+// Universal Symbol Extractor (Handles API v2/v3 schema differences)
 function getContractSymbol(c) {
   if (!c) return "";
   return c.underlying_symbol || c.symbol || (c.shortcode ? c.shortcode.split("_")[1] : "");
@@ -219,16 +220,17 @@ function openWS() {
   });
 }
 
-async function withRetry(fn, retries = 3, delay = 4000) {
+// Resilient 429 RateLimit Exponential Backoff with Jitter
+async function withRetry(fn, retries = 3, delay = 6000) {
   for (let i = 0; i < retries; i++) {
     try {
       return await fn();
     } catch (e) {
       const isRateLimit = e.message.includes("429") || e.message.includes("RateLimit");
       if (i === retries - 1) throw e;
-      const currentDelay = isRateLimit ? delay * (i + 2) : delay;
+      const currentDelay = isRateLimit ? (delay * (i + 1) + Math.floor(Math.random() * 2000)) : delay;
       dbg(`Retry ${i+1}/${retries} after error: ${e.message}. Waiting ${currentDelay}ms...`);
-      await new Promise(r => setTimeout(r, currentDelay));
+      await sleep(currentDelay);
     }
   }
 }
@@ -312,12 +314,12 @@ async function getDerivOTP(accountId) {
   return json.data.url;
 }
 
-// ── Authenticated Server Contract Status (Fetches a fresh OTP on every attempt) ──
+// ── Authenticated Server Contract Status (Fresh OTP per request) ──
 async function getServerContractStatus(contractId, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
     const accountId = preAccountId || await getDerivAccountId();
-    const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
+    const wsUrl = await getDerivOTP(accountId);
     const response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
@@ -349,15 +351,15 @@ async function getServerContractStatus(contractId, preAccountId = null) {
       };
     }
     return null;
-  }, 3, 3000);
+  }, 3, 4000);
 }
 
-// ── Authenticated Portfolio Fetcher (Fetches a fresh OTP on every attempt) ──
+// ── Authenticated Portfolio Fetcher (Fresh OTP per request) ──
 async function getOpenPortfolio(preAccountId = null) {
   if (!DERIV_TOKEN || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
     const accountId = preAccountId || await getDerivAccountId();
-    const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
+    const wsUrl = await getDerivOTP(accountId);
     const response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
@@ -373,15 +375,15 @@ async function getOpenPortfolio(preAccountId = null) {
       throw new Error(`getOpenPortfolio error: ${JSON.stringify(data.error || data.errors)}`);
     }
     return data.portfolio?.contracts || [];
-  }, 3, 3000);
+  }, 3, 4000);
 }
 
-// ── Authenticated Profit Table Lookup (Fetches a fresh OTP on every attempt) ──
+// ── Authenticated Profit Table Lookup (Fresh OTP per request) ──
 async function getContractProfitFromHistory(contractId, approxOpenEpoch, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
     const accountId = preAccountId || await getDerivAccountId();
-    const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
+    const wsUrl = await getDerivOTP(accountId);
     const response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
@@ -411,15 +413,15 @@ async function getContractProfitFromHistory(contractId, approxOpenEpoch, preAcco
       : (parseFloat(match.sell_price) - parseFloat(match.buy_price));
 
     return { profit, sellTime: match.sell_time };
-  }, 3, 3000);
+  }, 3, 4000);
 }
 
-// ── Authenticated Broker-Side Stop Loss Update (Fetches a fresh OTP on every attempt) ──
+// ── Authenticated Broker-Side Stop Loss Update ──
 async function updateContractStopLoss(contractId, slAmount, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return false;
   return withRetry(async () => {
     const accountId = preAccountId || await getDerivAccountId();
-    const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
+    const wsUrl = await getDerivOTP(accountId);
     const response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
@@ -461,10 +463,10 @@ async function updateContractStopLoss(contractId, slAmount, preAccountId = null)
 
     dbg(`[${REPO_LABEL}] contract_update returned no error but unrecognized success shape — treating as failure this cycle.`);
     return false;
-  }, 2, 2000);
+  }, 2, 3000);
 }
 
-// ── Idempotent Trade Execution (Fetches a fresh OTP on every attempt) ──
+// ── Idempotent Trade Execution ──
 async function executeTrade(direction) {
   if (!DERIV_TOKEN || !DERIV_APP_ID || !PROXY_URL || !PROXY_SECRET) return null;
   const startTimeEpoch = Math.floor(Date.now() / 1000);
@@ -493,7 +495,7 @@ async function executeTrade(direction) {
     try {
       console.log(`🔄 Sending ${direction} trade via Cloudflare proxy (attempt ${attempt}/3)...`);
       const accountId = await getDerivAccountId();
-      const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
+      const wsUrl = await getDerivOTP(accountId);
       const slDollars = parseFloat(STAKE_USD.toFixed(2));
       const tpValue = typeof SAFETY_TP_USD !== 'undefined' ? SAFETY_TP_USD : 8.00;
       const params = {
@@ -524,7 +526,7 @@ async function executeTrade(direction) {
         const errStr = JSON.stringify(data.error || data.errors);
         if (errStr.includes("429") || errStr.includes("RateLimit")) {
           console.warn(`429 RateLimit on buy. Waiting before retry...`);
-          await new Promise(r => setTimeout(r, 4000 * attempt));
+          await sleep(6000 * attempt);
           continue;
         }
         throw new Error(`Broker error: ${errStr}`);
@@ -539,19 +541,19 @@ async function executeTrade(direction) {
     } catch (err) {
       console.warn(`[${REPO_LABEL}] Buy attempt ${attempt} network error: ${err.message}.`);
       if (attempt === 3) throw err;
-      await new Promise(r => setTimeout(r, 3000 * attempt));
+      await sleep(4000 * attempt);
     }
   }
   return null;
 }
 
-// ── Resilient Contract Closing (Fetches a fresh OTP on every attempt) ──
+// ── Resilient Contract Closing (Increased backoff & fresh OTP) ──
 async function closeContract(contractId, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
     console.log(`🔄 Closing contract ${contractId} via proxy...`);
     const accountId = preAccountId || await getDerivAccountId();
-    const wsUrl = await getDerivOTP(accountId); // Always fresh OTP
+    const wsUrl = await getDerivOTP(accountId);
     const response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-proxy-secret": PROXY_SECRET },
@@ -567,7 +569,7 @@ async function closeContract(contractId, preAccountId = null) {
       throw new Error(`429/RateLimit/Error: ${errStr}`);
     }
     return data;
-  }, 4, 5000);
+  }, 4, 6000);
 }
 
 // ==================== TECHNICAL ANALYSIS & INDICATORS ====================
@@ -864,7 +866,6 @@ async function runScanMode() {
   let trades = [];
   try { trades = JSON.parse(fs.readFileSync("trades.json")); } catch {}
 
-  // Pre-fetch account ID once for this scan cycle (Account ID is static and safe to cache)
   let cachedAccountId = null;
   try {
     cachedAccountId = await getDerivAccountId();
@@ -894,6 +895,7 @@ async function runScanMode() {
   }
 
   for (const liveContract of allLiveContracts) {
+    await sleep(500); // 500ms pacing between multiple adoptions
     const liveStartTime = liveContract.date_start ? liveContract.date_start * 1000 : null;
     const expectedType = liveContract.contract_type === "MULTUP" ? "BUY" : "SELL";
 
@@ -914,7 +916,6 @@ async function runScanMode() {
       console.warn(`[${REPO_LABEL}] Unmanaged active contract ${liveContract.contract_id} found on Deriv! Adopting.`);
       const dir = expectedType;
       
-      // Fetch true spot price (never use buy_price $5 stake)
       let entryPrice = 0;
       try {
         const poc = await getServerContractStatus(liveContract.contract_id, cachedAccountId);
@@ -1009,6 +1010,7 @@ async function runScanMode() {
     const currentPrice = tradeData.price;
 
     for (const openTrade of openTradesList) {
+      await sleep(1500); // 1.5s throttling delay per open contract
       let pnl = calcUnrealizedPnL(openTrade, currentPrice);
       let usingServerTruthPnl = false;
 
@@ -1053,6 +1055,8 @@ async function runScanMode() {
       // ── Dynamic Live-Trailing Parabolic SAR Stop Loss ──
       let psarReversalExit = false;
       let psarExitReason = "";
+      let isLossSide = false;
+      let targetNewSl = null;
 
       if (tradeData.candles && tradeData.candles.length >= 2) {
         const psarValues = calculatePSAR(tradeData.candles, PSAR_STEP, PSAR_MAX);
@@ -1063,7 +1067,7 @@ async function runScanMode() {
         const candleHigh = parseFloat(closedCandle.high);
 
         if (livePsar != null) {
-          const psarIsLossSide = openTrade.direction === "BUY"
+          isLossSide = openTrade.direction === "BUY"
             ? livePsar < openTrade.entry
             : livePsar > openTrade.entry;
 
@@ -1071,59 +1075,19 @@ async function runScanMode() {
             if (openTrade.psarAligned) {
               openTrade.sl = Math.max(openTrade.sl, livePsar);
 
-              if (psarIsLossSide && openTrade.contractId && !openTrade.profitLockPhase) {
-                const rawLoss = (((openTrade.entry - livePsar) / openTrade.entry) * STAKE_USD * MULTIPLIER) + COMMISSION_USD;
-                const newSlAmount = parseFloat(Math.min(STAKE_USD, Math.max(0.10, rawLoss)).toFixed(2));
-                const currentBrokerSl = openTrade.brokerSlAmount || STAKE_USD;
-
-                if (newSlAmount < currentBrokerSl - 0.05) {
-                  const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId);
-                  if (updated) {
-                    openTrade.brokerSlAmount = newSlAmount;
-                    dbg(`[${REPO_LABEL}] Pushed tighter broker SL: $${newSlAmount.toFixed(2)} for BUY contract ${openTrade.contractId}`);
-                  }
-                }
-              } else if (!psarIsLossSide && openTrade.contractId && !openTrade.profitLockPhase) {
-                const candidateFloors = [
-                  COMMISSION_USD + 0.10,
-                  COMMISSION_USD + 0.25,
-                  COMMISSION_USD + 0.50,
-                  COMMISSION_USD + 1.00
-                ].map(v => parseFloat(v.toFixed(2)));
-
-                for (const candidate of candidateFloors) {
-                  if ((openTrade.brokerSlAmount || STAKE_USD) <= candidate) break;
-                  const updated = await updateContractStopLoss(openTrade.contractId, candidate, cachedAccountId);
-                  if (updated) {
-                    openTrade.profitLockPhase = true;
-                    openTrade.brokerSlAmount = candidate;
-                    console.log(`[${REPO_LABEL}] (Phase 2) Profit-Lock Active: Pinned broker SL near breakeven ($${candidate.toFixed(2)}) for BUY contract ${openTrade.contractId}`);
-                    break;
-                  }
-                }
-              }
-
-              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-
               if (currentPrice <= openTrade.sl || candleLow <= openTrade.sl || livePsar >= currentClose) {
                 psarReversalExit = true;
                 psarExitReason = `Parabolic SAR Stop Loss — price breached SAR level (${openTrade.sl.toFixed(4)})`;
+              } else if (isLossSide && openTrade.contractId && !openTrade.profitLockPhase) {
+                const rawLoss = (((openTrade.entry - livePsar) / openTrade.entry) * STAKE_USD * MULTIPLIER) + COMMISSION_USD;
+                targetNewSl = parseFloat(Math.min(STAKE_USD, Math.max(0.10, rawLoss)).toFixed(2));
               }
             } else {
               if (livePsar < currentClose) {
                 openTrade.psarAligned = true;
                 openTrade.sl = Math.max(openTrade.sl, livePsar);
-
-                if (openTrade.contractId) {
-                  const rawLoss = (((openTrade.entry - livePsar) / openTrade.entry) * STAKE_USD * MULTIPLIER) + COMMISSION_USD;
-                  const newSlAmount = parseFloat(Math.min(STAKE_USD, Math.max(0.10, rawLoss)).toFixed(2));
-                  if (newSlAmount < (openTrade.brokerSlAmount || STAKE_USD) - 0.05) {
-                    const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId);
-                    if (updated) openTrade.brokerSlAmount = newSlAmount;
-                  }
-                }
-
-                fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+                const rawLoss = (((openTrade.entry - livePsar) / openTrade.entry) * STAKE_USD * MULTIPLIER) + COMMISSION_USD;
+                targetNewSl = parseFloat(Math.min(STAKE_USD, Math.max(0.10, rawLoss)).toFixed(2));
                 dbg(`PSAR aligned for open trade ${openTrade.contractId}. New SL: ${openTrade.sl.toFixed(4)}`);
               }
             }
@@ -1131,59 +1095,19 @@ async function runScanMode() {
             if (openTrade.psarAligned) {
               openTrade.sl = Math.min(openTrade.sl, livePsar);
 
-              if (psarIsLossSide && openTrade.contractId && !openTrade.profitLockPhase) {
-                const rawLoss = (((livePsar - openTrade.entry) / openTrade.entry) * STAKE_USD * MULTIPLIER) + COMMISSION_USD;
-                const newSlAmount = parseFloat(Math.min(STAKE_USD, Math.max(0.10, rawLoss)).toFixed(2));
-                const currentBrokerSl = openTrade.brokerSlAmount || STAKE_USD;
-
-                if (newSlAmount < currentBrokerSl - 0.05) {
-                  const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId);
-                  if (updated) {
-                    openTrade.brokerSlAmount = newSlAmount;
-                    dbg(`[${REPO_LABEL}] Pushed tighter broker SL: $${newSlAmount.toFixed(2)} for SELL contract ${openTrade.contractId}`);
-                  }
-                }
-              } else if (!psarIsLossSide && openTrade.contractId && !openTrade.profitLockPhase) {
-                const candidateFloors = [
-                  COMMISSION_USD + 0.10,
-                  COMMISSION_USD + 0.25,
-                  COMMISSION_USD + 0.50,
-                  COMMISSION_USD + 1.00
-                ].map(v => parseFloat(v.toFixed(2)));
-
-                for (const candidate of candidateFloors) {
-                  if ((openTrade.brokerSlAmount || STAKE_USD) <= candidate) break;
-                  const updated = await updateContractStopLoss(openTrade.contractId, candidate, cachedAccountId);
-                  if (updated) {
-                    openTrade.profitLockPhase = true;
-                    openTrade.brokerSlAmount = candidate;
-                    console.log(`[${REPO_LABEL}] (Phase 2) Profit-Lock Active: Pinned broker SL near breakeven ($${candidate.toFixed(2)}) for SELL contract ${openTrade.contractId}`);
-                    break;
-                  }
-                }
-              }
-
-              fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-
               if (currentPrice >= openTrade.sl || candleHigh >= openTrade.sl || livePsar <= currentClose) {
                 psarReversalExit = true;
                 psarExitReason = `Parabolic SAR Stop Loss — price breached SAR level (${openTrade.sl.toFixed(4)})`;
+              } else if (isLossSide && openTrade.contractId && !openTrade.profitLockPhase) {
+                const rawLoss = (((livePsar - openTrade.entry) / openTrade.entry) * STAKE_USD * MULTIPLIER) + COMMISSION_USD;
+                targetNewSl = parseFloat(Math.min(STAKE_USD, Math.max(0.10, rawLoss)).toFixed(2));
               }
             } else {
               if (livePsar > currentClose) {
                 openTrade.psarAligned = true;
                 openTrade.sl = Math.min(openTrade.sl, livePsar);
-
-                if (openTrade.contractId) {
-                  const rawLoss = (((livePsar - openTrade.entry) / openTrade.entry) * STAKE_USD * MULTIPLIER) + COMMISSION_USD;
-                  const newSlAmount = parseFloat(Math.min(STAKE_USD, Math.max(0.10, rawLoss)).toFixed(2));
-                  if (newSlAmount < (openTrade.brokerSlAmount || STAKE_USD) - 0.05) {
-                    const updated = await updateContractStopLoss(openTrade.contractId, newSlAmount, cachedAccountId);
-                    if (updated) openTrade.brokerSlAmount = newSlAmount;
-                  }
-                }
-
-                fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+                const rawLoss = (((livePsar - openTrade.entry) / openTrade.entry) * STAKE_USD * MULTIPLIER) + COMMISSION_USD;
+                targetNewSl = parseFloat(Math.min(STAKE_USD, Math.max(0.10, rawLoss)).toFixed(2));
                 dbg(`PSAR aligned for open trade ${openTrade.contractId}. New SL: ${openTrade.sl.toFixed(4)}`);
               }
             }
@@ -1241,7 +1165,7 @@ async function runScanMode() {
         await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${finalResult}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
       };
 
-      // 1. Hard SL Price Check / PSAR Reversal Exit (Highest Priority)
+      // ── 1. Priority Exit Checks (If an exit is triggered, do NOT waste an SL update call!) ──
       const slBreached = openTrade.direction === "BUY" ? currentPrice <= openTrade.sl : currentPrice >= openTrade.sl;
       if (psarReversalExit || slBreached) {
         const reason = psarReversalExit ? psarExitReason : `Hard SL hit — price ${currentPrice.toFixed(4)} breached SL ${openTrade.sl.toFixed(4)}`;
@@ -1249,20 +1173,17 @@ async function runScanMode() {
         continue;
       }
 
-      // 1b. Server-Truth Catastrophic Backstop
       if (usingServerTruthPnl && pnl <= CATASTROPHIC_PNL_FLOOR) {
-        await closeWith("LOSS", `Server-truth catastrophic stop — realized pnl $${pnl.toFixed(2)} breached floor $${CATASTROPHIC_PNL_FLOOR.toFixed(2)} (financing/spread drag protection)`);
+        await closeWith("LOSS", `Server-truth catastrophic stop — realized pnl $${pnl.toFixed(2)} breached floor $${CATASTROPHIC_PNL_FLOOR.toFixed(2)}`);
         continue;
       }
 
-      // 2. TP2 Ultimate Target Hit
       const tp2Hit = openTrade.direction === "BUY" ? (openTrade.tp2 > 0 && currentPrice >= openTrade.tp2) : (openTrade.tp2 > 0 && currentPrice <= openTrade.tp2);
       if (tp2Hit) {
         await closeWith("WIN", `TP2 Ultimate Target hit — price ${currentPrice.toFixed(4)} reached BGA level ${openTrade.tp2.toFixed(4)}`);
         continue;
       }
 
-      // 3. Breakeven Protection & Server-Truth Pullback Exit ($0.70 Net Floor)
       if (!openTrade.breakevenSet && pnl >= BREAKEVEN_ACTIVATE_USD) {
         openTrade.breakevenSet = true;
         fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
@@ -1276,7 +1197,6 @@ async function runScanMode() {
         continue;
       }
 
-      // 4. TP1 Price Level Hit & High-Water Mark Trailing (50% Trail)
       if (!openTrade.tp1Reached && openTrade.tp1 > 0) {
         const tp1Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1;
         if (tp1Hit) {
@@ -1297,6 +1217,41 @@ async function runScanMode() {
           await closeWith(result, `Profit trail exit — locked ~$${pnl.toFixed(2)} (peak $${openTrade.peakProfit.toFixed(2)}, 50% drop from peak)`);
           continue;
         }
+      }
+
+      // ── 2. If Trade Remains Active: Push Broker Stop Loss Updates (Throttled) ──
+      if (openTrade.contractId && openTrade.psarAligned && !openTrade.profitLockPhase) {
+        if (isLossSide && targetNewSl != null) {
+          const currentBrokerSl = openTrade.brokerSlAmount || STAKE_USD;
+          if (targetNewSl < currentBrokerSl - 0.05) {
+            await sleep(500);
+            const updated = await updateContractStopLoss(openTrade.contractId, targetNewSl, cachedAccountId);
+            if (updated) {
+              openTrade.brokerSlAmount = targetNewSl;
+              dbg(`[${REPO_LABEL}] Pushed tighter broker SL: $${targetNewSl.toFixed(2)} for ${openTrade.direction} contract ${openTrade.contractId}`);
+            }
+          }
+        } else if (!isLossSide) {
+          const candidateFloors = [
+            COMMISSION_USD + 0.10,
+            COMMISSION_USD + 0.25,
+            COMMISSION_USD + 0.50,
+            COMMISSION_USD + 1.00
+          ].map(v => parseFloat(v.toFixed(2)));
+
+          for (const candidate of candidateFloors) {
+            if ((openTrade.brokerSlAmount || STAKE_USD) <= candidate) break;
+            await sleep(500);
+            const updated = await updateContractStopLoss(openTrade.contractId, candidate, cachedAccountId);
+            if (updated) {
+              openTrade.profitLockPhase = true;
+              openTrade.brokerSlAmount = candidate;
+              console.log(`[${REPO_LABEL}] (Phase 2) Profit-Lock Active: Pinned broker SL near breakeven ($${candidate.toFixed(2)}) for ${openTrade.direction} contract ${openTrade.contractId}`);
+              break;
+            }
+          }
+        }
+        fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
       }
     }
 
@@ -1687,7 +1642,7 @@ async function runScanMode() {
   const jitterMs = (REPO_INDEX * 12000) + Math.floor(Math.random() * 3000);
 
   dbg(`Staggering execution by ${jitterMs}ms (Repo Index: ${REPO_INDEX})...`);
-  await new Promise(r => setTimeout(r, jitterMs));
+  await sleep(jitterMs);
 
   if (MODE === "daily") {
     await runSummary("Daily");
