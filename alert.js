@@ -221,6 +221,7 @@ function openWS() {
   });
 }
 
+// Resilient RateLimit Backoff
 async function withRetry(fn, retries = 3, delay = 4000) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -314,7 +315,7 @@ async function getDerivOTP(accountId) {
   return json.data.url;
 }
 
-// ── Authenticated Server Contract Status (Fresh OTP per request) ──
+// ── Authenticated Server Contract Status ──
 async function getServerContractStatus(contractId, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -354,7 +355,7 @@ async function getServerContractStatus(contractId, preAccountId = null) {
   }, 3, 3000);
 }
 
-// ── Authenticated Portfolio Fetcher (Fresh OTP per request) ──
+// ── Authenticated Portfolio Fetcher ──
 async function getOpenPortfolio(preAccountId = null) {
   if (!DERIV_TOKEN || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -378,7 +379,7 @@ async function getOpenPortfolio(preAccountId = null) {
   }, 3, 3000);
 }
 
-// ── Authenticated Profit Table Lookup (Fresh OTP per request) ──
+// ── Authenticated Profit Table Lookup ──
 async function getContractProfitFromHistory(contractId, approxOpenEpoch, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -416,7 +417,7 @@ async function getContractProfitFromHistory(contractId, approxOpenEpoch, preAcco
   }, 3, 3000);
 }
 
-// ── Authenticated Broker-Side Stop Loss Update (Precision Check) ──
+// ── Authenticated Broker-Side Stop Loss Update ──
 async function updateContractStopLoss(contractId, slAmount, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return false;
   return withRetry(async () => {
@@ -828,20 +829,15 @@ function calculateBgaTakeProfits(entry, direction, slDistance, d1Candles) {
   }
 
   if (direction === "BUY") {
-    // Find all BGA levels above entry
     const validLevels = allLevels.filter(l => l > entry);
-
-    // Find the level closest to our ideal $4.00 profit price
     validLevels.sort((a, b) => Math.abs(a - idealTp1Price) - Math.abs(b - idealTp1Price));
     let tp1 = validLevels[0] || (baseWhole + step);
 
-    // Ensure TP1 is strictly below the $8.00 limit
     if (tp1 >= idealTp2Price) {
       const subCeilingLevels = validLevels.filter(l => l < idealTp2Price);
       tp1 = subCeilingLevels[0] || entry + (tp1PriceMove * 0.9);
     }
 
-    // TP2 targets the $8.00 zone, clamped by D1 Fib 261.8%
     let futureLevels = allLevels.filter(l => l > tp1).sort((a, b) => Math.abs(a - idealTp2Price) - Math.abs(b - idealTp2Price));
     let tp2 = futureLevels[0] || tp1 + halfStep;
     let tp3 = tp2 + halfStep;
@@ -855,20 +851,15 @@ function calculateBgaTakeProfits(entry, direction, slDistance, d1Candles) {
 
     return { tp1, tp2, tp3 };
   } else {
-    // Find all BGA levels below entry
     const validLevels = allLevels.filter(l => l < entry);
-
-    // Find the level closest to our ideal $4.00 profit price
     validLevels.sort((a, b) => Math.abs(a - idealTp1Price) - Math.abs(b - idealTp1Price));
     let tp1 = validLevels[0] || (baseWhole - step);
 
-    // Ensure TP1 is strictly above the $8.00 limit (for SELL, $8 profit is a lower price)
     if (tp1 <= idealTp2Price) {
       const subCeilingLevels = validLevels.filter(l => l > idealTp2Price);
       tp1 = subCeilingLevels[0] || entry - (tp1PriceMove * 0.9);
     }
 
-    // TP2 targets the $8.00 zone, clamped by D1 Fib 261.8%
     let futureLevels = allLevels.filter(l => l < tp1).sort((a, b) => Math.abs(a - idealTp2Price) - Math.abs(b - idealTp2Price));
     let tp2 = futureLevels[0] || tp1 - halfStep;
     let tp3 = tp2 - halfStep;
@@ -1221,13 +1212,15 @@ async function runScanMode() {
         continue;
       }
 
-      if (!openTrade.tp1Reached && openTrade.tp1 > 0) {
-        const tp1Hit = openTrade.direction === "BUY" ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1;
-        if (tp1Hit) {
-          openTrade.tp1Reached = true;
-          fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
-          await sendTelegram(`🎯 TP1 BGA Whole Number reached (${openTrade.tp1.toFixed(4)}) on ${openTrade.direction} — 50% peak-drop trailing now armed.`);
-        }
+      // ── 4. TP1 Trigger: Price Level Hit OR Target Profit Hit ($4.00) ──> Arms 50% Trail ──
+      const isBuy = openTrade.direction === "BUY";
+      const priceHitTp1 = openTrade.tp1 > 0 && (isBuy ? currentPrice >= openTrade.tp1 : currentPrice <= openTrade.tp1);
+      const pnlHitTp1 = pnl >= TARGET_TP1_USD; // Reached $4.00 profit
+
+      if (!openTrade.tp1Reached && (priceHitTp1 || pnlHitTp1)) {
+        openTrade.tp1Reached = true;
+        fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
+        await sendTelegram(`🎯 *${REPO_LABEL} — TP1 Reached*\n\nProfit reached *$${pnl.toFixed(2)}* (Target: ~$${TARGET_TP1_USD.toFixed(2)})\n50% High-Water Mark trailing is now armed!`);
       }
 
       if (openTrade.tp1Reached) {
