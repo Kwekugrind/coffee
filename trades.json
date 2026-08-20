@@ -46,8 +46,9 @@
     "brokerSlAmount": 5,
     "profitLockPhase": false,
     "openTime": "2026-08-20 18:35:00",
-    "closeTime": null,
-    "result": null,
-    "orphanRetryCount": 2
+    "closeTime": "2026-08-20 18:55:53",
+    "result": "LOSS",
+    "orphanRetryCount": 3,
+    "resultSource": "estimated_fallback"
   }
 ]
