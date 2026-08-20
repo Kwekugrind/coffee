@@ -7,7 +7,7 @@
     "symbol": "1HZ75V",
     "direction": "SELL",
     "entry": 6896.27,
-    "sl": 6962.185369999999,
+    "sl": 6959.7213089,
     "tp1": 6800,
     "tp2": 6750,
     "tp3": 6700,
@@ -21,6 +21,6 @@
     "openTime": "2026-08-20 15:30:00",
     "closeTime": null,
     "result": null,
-    "orphanRetryCount": 1
+    "orphanRetryCount": 2
   }
 ]
