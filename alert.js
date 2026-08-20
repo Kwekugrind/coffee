@@ -28,7 +28,7 @@ const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const R
 const TRADING_SYMBOL = SYMBOL;
 const STAKE_USD = 5;
 const RISK_REWARD = 1.5;
-const SAFETY_TP_USD = 10.00; // $10 flat profit insurance ceiling on broker side
+const SAFETY_TP_USD = 8.00; // $8 flat profit insurance ceiling on broker side
 const BREAKEVEN_ACTIVATE_USD = 2.00; // Move SL to entry once profit hits $2.00
 const CATASTROPHIC_PNL_FLOOR = -5.50; // Server-truth catastrophic loss floor (cushion beyond -$5 hard SL for financing/slippage)
 const PSAR_STEP = 0.010; // Parabolic SAR acceleration factor step
