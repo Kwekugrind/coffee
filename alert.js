@@ -11,10 +11,10 @@ import fs from "fs";
 // const SYMBOL = "R_50"; const SYMBOL_NAME = "Volatility 50 Index"; const REPO_LABEL = "OmniSight (V50)"; const MULTIPLIER = 80; const COMMISSION_USD = 0.16;
 
 // --- 3. Lery's Alerts (Demo) ---
-// const SYMBOL = "R_75"; const SYMBOL_NAME = "Volatility 75 Index"; const REPO_LABEL = "Lery's Alerts (V75 Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
+const SYMBOL = "R_75"; const SYMBOL_NAME = "Volatility 75 Index"; const REPO_LABEL = "Lery's Alerts (V75 Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
 
 // --- 4. Coffee (Demo) ---
-const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const REPO_LABEL = "Coffee (V75-1s Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
+// const SYMBOL = "1HZ75V"; const SYMBOL_NAME = "Volatility 75 (1s) Index"; const REPO_LABEL = "Coffee (V75-1s Demo)"; const MULTIPLIER = 50; const COMMISSION_USD = 0.15;
 
 // --- 5. Milk (Demo) ---
 // const SYMBOL = "R_100"; const SYMBOL_NAME = "Volatility 100 Index"; const REPO_LABEL = "Milk (V100 Demo)"; const MULTIPLIER = 40; const COMMISSION_USD = 0.15;
@@ -809,10 +809,10 @@ function calculateBgaTakeProfits(entry, direction, slDistance, d1Candles) {
 
 // ==================== MAIN SCANNER & TRADE LOGIC ====================
 async function runScanMode() {
-  // FIX 4: Local lock file kept as a secondary/best-effort defense (CI uses workflow concurrency)
   const LOCK_FILE = "scan.lock";
   const LOCK_MAX_AGE_MS = 4 * 60 * 1000; // 4 minutes
 
+  // ── Concurrency Overlap Protection (Best effort secondary defense) ──
   if (fs.existsSync(LOCK_FILE)) {
     try {
       const lockTime = parseInt(fs.readFileSync(LOCK_FILE, "utf-8"), 10);
@@ -834,113 +834,119 @@ async function runScanMode() {
     try { trades = JSON.parse(fs.readFileSync("trades.json")); } catch {}
 
     // ── STEP 0: SERVER-TRUTH BROKER PORTFOLIO RECONCILIATION ──
-    // FIX 2: Loop through ALL live contracts on Deriv, never index single [0]
     let allLiveContracts = [];
+    let portfolioCheckSucceeded = false;
+
     try {
       const allPortfolio = await getOpenPortfolio();
-      allLiveContracts = allPortfolio?.filter(c => c.symbol === TRADING_SYMBOL) || [];
-      dbg(`Live broker contracts on Deriv for ${TRADING_SYMBOL}: ${allLiveContracts.length}`);
-    } catch (pErr) {
-      console.warn(`[${REPO_LABEL}] Warning: Failed to fetch live broker portfolio: ${pErr.message}`);
-    }
-
-    // FIX 2: High-Priority Alert if multiple live duplicate contracts are detected
-    if (allLiveContracts.length > 1) {
-      console.error(`🚨 [${REPO_LABEL}] DUPLICATE CONTRACTS DETECTED: Found ${allLiveContracts.length} live contracts on Deriv!`);
-      const dupDetails = allLiveContracts.map(c => `• Contract ID: \`${c.contract_id}\` (${c.contract_type}) @ ${c.buy_price || c.entry_spot || 'N/A'}`).join("\n");
-      await sendTelegram(`🚨 *DUPLICATE CONTRACTS DETECTED — ${REPO_LABEL}*\n\nFound *${allLiveContracts.length}* live open contracts on Deriv simultaneously:\n${dupDetails}\n\n⚠️ Bot will manage all contracts independently.`);
-    }
-
-    // FIX 2: Reconcile EVERY live contract in allLiveContracts individually against trades.json
-    for (const liveContract of allLiveContracts) {
-      const liveStartTime = liveContract.date_start ? liveContract.date_start * 1000 : null;
-      const expectedType = liveContract.contract_type === "MULTUP" ? "BUY" : "SELL";
-
-      // Match by exact contractId, or pending with tight time (within 60s) and direction correlation
-      let matchedTrade = trades.find(t =>
-        String(t.contractId) === String(liveContract.contract_id) ||
-        (t.pending && t.direction === expectedType && liveStartTime && Math.abs(new Date(t.openTime).getTime() - liveStartTime) <= 60000)
-      );
-
-      if (matchedTrade) {
-        if (matchedTrade.pending) {
-          matchedTrade.contractId = liveContract.contract_id;
-          matchedTrade.pending = false;
-          dbg(`Reconciled pending trade record to live contract ${liveContract.contract_id}`);
-        }
+      if (Array.isArray(allPortfolio)) {
+        allLiveContracts = allPortfolio.filter(c => c.symbol === TRADING_SYMBOL);
+        portfolioCheckSucceeded = true;
+        dbg(`Live broker contracts on Deriv for ${TRADING_SYMBOL}: ${allLiveContracts.length}`);
       } else {
-        // FIX 2 & FIX 5: Adopt unmanaged contract with a REAL calculated SL (never 0)
-        console.warn(`[${REPO_LABEL}] (FIX 2) Unmanaged active contract ${liveContract.contract_id} found on Deriv! Adopting.`);
-        const dir = expectedType;
-        const entryPrice = parseFloat(liveContract.buy_price || liveContract.entry_spot || 0);
-        const calculatedSl = deriveHardStopPrice(entryPrice, dir); // FIX 5: Real -$5 hard stop SL level
-
-        const adoptedRecord = {
-          id: `${SYMBOL}-${new Date().toISOString()}`,
-          contractId: liveContract.contract_id,
-          pending: false,
-          repo: REPO_LABEL,
-          symbol: SYMBOL,
-          direction: dir,
-          entry: entryPrice,
-          sl: calculatedSl, // FIX 5: Never 0
-          tp1: 0,
-          tp2: 0,
-          tp3: 0,
-          h1OpenAtEntry: null,
-          tp1Reached: false,
-          breakevenSet: false,
-          peakProfit: null,
-          rr: RISK_REWARD,
-          entryType: 'RECOVERED_LIVE',
-          psarAligned: false,
-          openTime: liveStartTime ? new Date(liveStartTime).toISOString().replace("T", " ").substring(0, 19) : new Date().toISOString().replace("T", " ").substring(0, 19),
-          closeTime: null,
-          result: null
-        };
-        trades.push(adoptedRecord);
-        await sendTelegram(`🛡️ *${REPO_LABEL}* — Adopted unmanaged live contract \`${liveContract.contract_id}\` from Deriv into tracking (SL: ${calculatedSl.toFixed(4)}).`);
+        console.warn(`[${REPO_LABEL}] Warning: getOpenPortfolio returned non-array response. Portfolio check inconclusive.`);
       }
+    } catch (pErr) {
+      console.warn(`[${REPO_LABEL}] Warning: Failed to fetch live broker portfolio: ${pErr.message}. Portfolio check inconclusive — skipping reconciliation and orphan cleanup for this scan.`);
     }
 
-    // FIX 2: Clean up orphaned trades in trades.json that no longer exist in allLiveContracts
-    const liveContractIdSet = new Set(allLiveContracts.map(c => String(c.contract_id)));
-    for (let i = trades.length - 1; i >= 0; i--) {
-      const t = trades[i];
-      if (!t.result) {
-        if (t.pending) {
-          // If pending attempt is confirmed not in live portfolio, clear it
-          console.log(`[${REPO_LABEL}] Pending trade attempt ${t.id} confirmed NOT on Deriv. Clearing.`);
-          trades.splice(i, 1);
-        } else if (t.contractId && !liveContractIdSet.has(String(t.contractId))) {
-          // Contract closed on Deriv while offline — recover true PnL via profit_table
-          console.warn(`[${REPO_LABEL}] Open trade ${t.contractId} no longer in portfolio. Attempting profit_table recovery...`);
-          let recovered = null;
-          try {
-            const openEpoch = t.openTime ? Math.floor(new Date(t.openTime).getTime() / 1000) : undefined;
-            recovered = await getContractProfitFromHistory(t.contractId, openEpoch);
-          } catch (histErr) {
-            console.warn(`[${REPO_LABEL}] profit_table lookup failed: ${histErr.message}`);
-          }
+    // Only run multi-contract adoption and orphan cleanup when the portfolio query succeeded
+    if (portfolioCheckSucceeded) {
+      // FIX 2: High-Priority Alert if multiple live duplicate contracts are detected
+      if (allLiveContracts.length > 1) {
+        console.error(`🚨 [${REPO_LABEL}] DUPLICATE CONTRACTS DETECTED: Found ${allLiveContracts.length} live contracts on Deriv!`);
+        const dupDetails = allLiveContracts.map(c => `• Contract ID: \`${c.contract_id}\` (${c.contract_type}) @ ${c.buy_price || c.entry_spot || 'N/A'}`).join("\n");
+        await sendTelegram(`🚨 *DUPLICATE CONTRACTS DETECTED — ${REPO_LABEL}*\n\nFound *${allLiveContracts.length}* live open contracts on Deriv simultaneously:\n${dupDetails}\n\n⚠️ Bot will manage all contracts independently.`);
+      }
 
-          if (recovered && typeof recovered.profit === 'number') {
-            t.result = recovered.profit >= 0 ? "WIN" : "LOSS";
-            t.resultSource = "server_history_verified";
-            t.closeTime = t.closeTime || (recovered.sellTime ? new Date(recovered.sellTime * 1000).toISOString().replace("T", " ").substring(0, 19) : new Date().toISOString().replace("T", " ").substring(0, 19));
-            console.log(`[${REPO_LABEL}] Recovered true realized PnL from profit_table: $${recovered.profit.toFixed(2)}.`);
-          } else {
-            t.orphanRetryCount = (t.orphanRetryCount || 0) + 1;
-            if (t.orphanRetryCount >= 3) {
-              console.warn(`[${REPO_LABEL}] Contract ${t.contractId} unrecoverable after 3 attempts. Defaulting to LOSS.`);
-              t.result = t.result || "LOSS";
-              t.resultSource = "estimated_fallback";
-              t.closeTime = t.closeTime || new Date().toISOString().replace("T", " ").substring(0, 19);
+      // FIX 2: Reconcile EVERY live contract in allLiveContracts individually against trades.json
+      for (const liveContract of allLiveContracts) {
+        const liveStartTime = liveContract.date_start ? liveContract.date_start * 1000 : null;
+        const expectedType = liveContract.contract_type === "MULTUP" ? "BUY" : "SELL";
+
+        let matchedTrade = trades.find(t =>
+          String(t.contractId) === String(liveContract.contract_id) ||
+          (t.pending && t.direction === expectedType && liveStartTime && Math.abs(new Date(t.openTime).getTime() - liveStartTime) <= 60000)
+        );
+
+        if (matchedTrade) {
+          if (matchedTrade.pending) {
+            matchedTrade.contractId = liveContract.contract_id;
+            matchedTrade.pending = false;
+            dbg(`Reconciled pending trade record to live contract ${liveContract.contract_id}`);
+          }
+        } else {
+          // FIX 2 & FIX 5: Adopt unmanaged contract with a REAL calculated SL (never 0)
+          console.warn(`[${REPO_LABEL}] (FIX 2) Unmanaged active contract ${liveContract.contract_id} found on Deriv! Adopting.`);
+          const dir = expectedType;
+          const entryPrice = parseFloat(liveContract.buy_price || liveContract.entry_spot || 0);
+          const calculatedSl = deriveHardStopPrice(entryPrice, dir);
+
+          const adoptedRecord = {
+            id: `${SYMBOL}-${new Date().toISOString()}`,
+            contractId: liveContract.contract_id,
+            pending: false,
+            repo: REPO_LABEL,
+            symbol: SYMBOL,
+            direction: dir,
+            entry: entryPrice,
+            sl: calculatedSl,
+            tp1: 0,
+            tp2: 0,
+            tp3: 0,
+            h1OpenAtEntry: null,
+            tp1Reached: false,
+            breakevenSet: false,
+            peakProfit: null,
+            rr: RISK_REWARD,
+            entryType: 'RECOVERED_LIVE',
+            psarAligned: false,
+            openTime: liveStartTime ? new Date(liveStartTime).toISOString().replace("T", " ").substring(0, 19) : new Date().toISOString().replace("T", " ").substring(0, 19),
+            closeTime: null,
+            result: null
+          };
+          trades.push(adoptedRecord);
+          await sendTelegram(`🛡️ *${REPO_LABEL}* — Adopted unmanaged live contract \`${liveContract.contract_id}\` from Deriv into tracking (SL: ${calculatedSl.toFixed(4)}).`);
+        }
+      }
+
+      // FIX 2: Clean up orphaned trades in trades.json ONLY when portfolio check succeeded
+      const liveContractIdSet = new Set(allLiveContracts.map(c => String(c.contract_id)));
+      for (let i = trades.length - 1; i >= 0; i--) {
+        const t = trades[i];
+        if (!t.result) {
+          if (t.pending) {
+            console.log(`[${REPO_LABEL}] Pending trade attempt ${t.id} confirmed NOT on Deriv. Clearing.`);
+            trades.splice(i, 1);
+          } else if (t.contractId && !liveContractIdSet.has(String(t.contractId))) {
+            console.warn(`[${REPO_LABEL}] Open trade ${t.contractId} no longer in portfolio. Attempting profit_table recovery...`);
+            let recovered = null;
+            try {
+              const openEpoch = t.openTime ? Math.floor(new Date(t.openTime).getTime() / 1000) : undefined;
+              recovered = await getContractProfitFromHistory(t.contractId, openEpoch);
+            } catch (histErr) {
+              console.warn(`[${REPO_LABEL}] profit_table lookup failed: ${histErr.message}`);
+            }
+
+            if (recovered && typeof recovered.profit === 'number') {
+              t.result = recovered.profit >= 0 ? "WIN" : "LOSS";
+              t.resultSource = "server_history_verified";
+              t.closeTime = t.closeTime || (recovered.sellTime ? new Date(recovered.sellTime * 1000).toISOString().replace("T", " ").substring(0, 19) : new Date().toISOString().replace("T", " ").substring(0, 19));
+              console.log(`[${REPO_LABEL}] Recovered true realized PnL from profit_table: $${recovered.profit.toFixed(2)}.`);
+            } else {
+              t.orphanRetryCount = (t.orphanRetryCount || 0) + 1;
+              if (t.orphanRetryCount >= 3) {
+                console.warn(`[${REPO_LABEL}] Contract ${t.contractId} unrecoverable after 3 attempts. Defaulting to LOSS.`);
+                t.result = t.result || "LOSS";
+                t.resultSource = "estimated_fallback";
+                t.closeTime = t.closeTime || new Date().toISOString().replace("T", " ").substring(0, 19);
+              }
             }
           }
         }
       }
+      fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
     }
-    fs.writeFileSync("trades.json", JSON.stringify(trades, null, 2));
 
     await checkTelegramCommands();
 
@@ -1137,7 +1143,14 @@ async function runScanMode() {
       return;
     }
 
-    // ── Signal Scan (STRICTLY ONLY REACHED WHEN 0 ACTIVE CONTRACTS EXIST ON DERIV) ──
+    // ── GUARD BEFORE SIGNAL SCAN: Block scanning if ANY unresolved trade (including pending: true) exists ──
+    const hasUnresolvedTrades = trades.some(t => !t.result);
+    if (hasUnresolvedTrades) {
+      console.log(`[${REPO_LABEL}] Unresolved trade(s) (including pending attempts) present in trades.json — skipping signal scan.`);
+      return;
+    }
+
+    // ── Signal Scan (STRICTLY ONLY REACHED WHEN 0 ACTIVE OR PENDING TRADES EXIST) ──
     const scanData = await fetchAllData();
     const candles = scanData.m5;
     const h1Candles = scanData.h1;
@@ -1383,7 +1396,10 @@ async function runScanMode() {
       console.log(`[${REPO_LABEL}] (FIX 3) Signal triggered for ${direction}. Performing immediate pre-execution portfolio check...`);
       try {
         const preCheckPortfolio = await getOpenPortfolio();
-        const preCheckContracts = preCheckPortfolio?.filter(c => c.symbol === TRADING_SYMBOL) || [];
+        if (!Array.isArray(preCheckPortfolio)) {
+          throw new Error("getOpenPortfolio returned non-array or invalid response");
+        }
+        const preCheckContracts = preCheckPortfolio.filter(c => c.symbol === TRADING_SYMBOL);
         if (preCheckContracts.length > 0) {
           console.warn(`[${REPO_LABEL}] (FIX 3: Trade Aborted) Signal fired but ${preCheckContracts.length} open contract(s) appeared on Deriv moments before execution. Aborting.`);
           await sendTelegram(`⚠️ *${REPO_LABEL} — Trade Aborted*\n\nSignal triggered for *${direction}*, but an active position (\`${preCheckContracts[0].contract_id}\`) was detected on Deriv immediately before order dispatch. Skipping to prevent duplicate.`);
@@ -1392,7 +1408,12 @@ async function runScanMode() {
           return; // Physically impossible to submit duplicate
         }
       } catch (preErr) {
-        console.warn(`[${REPO_LABEL}] Pre-execution portfolio check warning: ${preErr.message}. Proceeding carefully.`);
+        // Strict Fail-Safe: If pre-check fails due to network/API error, ABORT order submission to eliminate duplicate risk
+        console.warn(`[${REPO_LABEL}] (FIX 3: Trade Aborted) Pre-execution portfolio verification failed: ${preErr.message}. Aborting order submission to eliminate duplicate risk.`);
+        await sendTelegram(`⚠️ *${REPO_LABEL} — Trade Aborted*\n\nSignal triggered for *${direction}*, but Deriv portfolio verification could not be completed (${preErr.message}). Aborting trade to guarantee zero-duplicate risk.`);
+        state.lastProcessedEpoch = currentCandleEpoch;
+        fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+        return;
       }
 
       const slDollars = parseFloat(STAKE_USD.toFixed(2));
