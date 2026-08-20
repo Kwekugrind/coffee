@@ -11,8 +11,6 @@ on:
         description: "Bot mode (scan, weekly, monthly, test, close_win, close_loss)"
         required: false
         default: "scan"
-  schedule:
-    - cron: '*/5 * * * *'
 
 concurrency:
   group: deriv-bot-${{ github.repository }}
