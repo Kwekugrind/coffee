@@ -1663,7 +1663,7 @@ async function runScanMode() {
 // ==================== EXECUTION MODES ====================
 (async () => {
   const REPO_INDEX = { R_10: 0, R_50: 1, R_75: 2, "1HZ75V": 3, R_100: 4, R_25: 5, "1HZ100V": 6 }[SYMBOL] ?? 0;
-  const jitterMs = (REPO_INDEX * 12000) + Math.floor(Math.random() * 3000);
+  const jitterMs = (REPO_INDEX * 8000) + Math.floor(Math.random() * 2000);
 
   dbg(`Staggering execution by ${jitterMs}ms (Repo Index: ${REPO_INDEX})...`);
   await sleep(jitterMs);
