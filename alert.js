@@ -52,7 +52,7 @@ const PHASE_A_WINDOW_SECONDS = 2.5 * 60 * 60; // 2h 30m window for Phase A after
 const DEBUG = process.env.DEBUG === "true";
 function dbg(...a) { if (DEBUG) console.log("[DBG]", ...a); }
 
-// Universal Symbol Extractor (Handles API v2/v3 schema differences)
+// Universal Symbol Extractor (Prevents schema mismatches between API v2 and v3)
 function getContractSymbol(c) {
   if (!c) return "";
   return c.underlying_symbol || c.symbol || (c.shortcode ? c.shortcode.split("_")[1] : "");
@@ -219,7 +219,6 @@ function openWS() {
   });
 }
 
-// Smart 429 RateLimit Backoff
 async function withRetry(fn, retries = 3, delay = 4000) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -234,7 +233,7 @@ async function withRetry(fn, retries = 3, delay = 4000) {
   }
 }
 
-// CONSOLIDATED DATA FETCHER (M5, H1, D1)
+// Consolidated Data Fetcher (M5, H1, D1)
 async function fetchAllData() {
   return withRetry(async () => {
     return new Promise((resolve, reject) => {
@@ -261,7 +260,7 @@ async function fetchAllData() {
   });
 }
 
-// CONSOLIDATED OPEN TRADE FETCHER
+// Consolidated Open Trade Fetcher (Price + 120 M5 Candles)
 async function fetchOpenTradeData() {
   return withRetry(async () => {
     return new Promise((resolve, reject) => {
@@ -343,6 +342,7 @@ async function getServerContractStatus(contractId, preAccountId = null, preWsUrl
         profit: poc.profit,
         bid_price: poc.bid_price,
         current_spot: poc.current_spot,
+        entry_spot: poc.entry_spot || poc.barrier || poc.entry_tick,
         is_sold: poc.is_sold,
         is_expired: poc.is_expired,
         status: poc.status
@@ -486,7 +486,7 @@ async function executeTrade(direction) {
         }
       } catch (checkErr) {
         console.warn(`[${REPO_LABEL}] Pre-retry portfolio check failed: ${checkErr.message}. Aborting trade.`);
-        return null; // Strict abort if portfolio status is uncertain
+        return null;
       }
     }
 
@@ -779,7 +779,6 @@ function calculateBgaTakeProfits(entry, direction, slDistance, d1Candles) {
 
   const halfStep = step / 2;
   const baseWhole = Math.round(entry / step) * step;
-
   const minBuffer = Math.max(step * 0.50, slDistance);
 
   let fibMaxLimit = null;
@@ -865,12 +864,21 @@ async function runScanMode() {
   let trades = [];
   try { trades = JSON.parse(fs.readFileSync("trades.json")); } catch {}
 
+  // Pre-fetch account/OTP credentials once for this scan cycle
+  let cachedAccountId = null, cachedWsUrl = null;
+  try {
+    cachedAccountId = await getDerivAccountId();
+    cachedWsUrl = await getDerivOTP(cachedAccountId);
+  } catch (e) {
+    dbg(`[${REPO_LABEL}] Failed to pre-fetch account/OTP for this scan cycle: ${e.message}`);
+  }
+
   // ── STEP 0: SERVER-TRUTH BROKER PORTFOLIO RECONCILIATION ──
   let allLiveContracts = [];
   try {
     const allPortfolio = await getOpenPortfolio();
     if (!Array.isArray(allPortfolio)) {
-      console.warn(`[${REPO_LABEL}] Warning: getOpenPortfolio returned non-array. Aborting to prevent duplicates.`);
+      console.warn(`[${REPO_LABEL}] Warning: getOpenPortfolio returned non-array. Aborting scan to prevent duplicates.`);
       return;
     }
     allLiveContracts = allPortfolio.filter(c => getContractSymbol(c) === TRADING_SYMBOL);
@@ -880,10 +888,9 @@ async function runScanMode() {
     return;
   }
 
-  // Multi-contract adoption & orphan cleanup
   if (allLiveContracts.length > 1) {
     console.error(`🚨 [${REPO_LABEL}] DUPLICATE CONTRACTS DETECTED: Found ${allLiveContracts.length} live contracts on Deriv!`);
-    const dupDetails = allLiveContracts.map(c => `• Contract ID: \`${c.contract_id}\` (${c.contract_type}) @ ${c.buy_price || c.entry_spot || 'N/A'}`).join("\n");
+    const dupDetails = allLiveContracts.map(c => `• Contract ID: \`${c.contract_id}\` (${c.contract_type}) @ ${c.buy_price || 'N/A'}`).join("\n");
     await sendTelegram(`🚨 *DUPLICATE CONTRACTS DETECTED — ${REPO_LABEL}*\n\nFound *${allLiveContracts.length}* live open contracts on Deriv simultaneously:\n${dupDetails}\n\n⚠️ Bot will manage all contracts independently.`);
   }
 
@@ -907,7 +914,19 @@ async function runScanMode() {
     } else {
       console.warn(`[${REPO_LABEL}] Unmanaged active contract ${liveContract.contract_id} found on Deriv! Adopting.`);
       const dir = expectedType;
-      const entryPrice = parseFloat(liveContract.buy_price || liveContract.entry_spot || 0);
+      
+      // Fetch true spot price (never use buy_price $5 stake)
+      let entryPrice = 0;
+      try {
+        const poc = await getServerContractStatus(liveContract.contract_id, cachedAccountId, cachedWsUrl);
+        if (poc && (poc.entry_spot || poc.current_spot)) {
+          entryPrice = parseFloat(poc.entry_spot || poc.current_spot);
+        }
+      } catch {}
+      if (!entryPrice || entryPrice <= 0) {
+        entryPrice = await getCurrentPrice(TRADING_SYMBOL);
+      }
+
       const calculatedSl = deriveHardStopPrice(entryPrice, dir);
 
       const adoptedRecord = {
@@ -936,7 +955,7 @@ async function runScanMode() {
         result: null
       };
       trades.push(adoptedRecord);
-      await sendTelegram(`🛡️ *${REPO_LABEL}* — Adopted unmanaged live contract \`${liveContract.contract_id}\` from Deriv into tracking (SL: ${calculatedSl.toFixed(4)}).`);
+      await sendTelegram(`🛡️ *${REPO_LABEL}* — Adopted unmanaged live contract \`${liveContract.contract_id}\` from Deriv into tracking (Entry: ${entryPrice.toFixed(4)}, SL: ${calculatedSl.toFixed(4)}).`);
     }
   }
 
@@ -978,19 +997,17 @@ async function runScanMode() {
 
   await checkTelegramCommands();
 
-  // ── Open Position Management (Loops through EVERY open contract) ──
+  // ── Open Position Management ──
   const openTradesList = trades.filter(t => !t.result && !t.pending);
   if (openTradesList.length > 0) {
-    const tradeData = await fetchOpenTradeData();
-    const currentPrice = tradeData.price;
-
-    let cachedAccountId = null, cachedWsUrl = null;
+    let tradeData;
     try {
-      cachedAccountId = await getDerivAccountId();
-      cachedWsUrl = await getDerivOTP(cachedAccountId);
-    } catch (e) {
-      dbg(`[${REPO_LABEL}] Failed to pre-fetch account/OTP for this scan cycle: ${e.message}`);
+      tradeData = await fetchOpenTradeData();
+    } catch (err) {
+      console.warn(`[${REPO_LABEL}] Failed to fetch open trade data: ${err.message}. Skipping management loop.`);
+      return;
     }
+    const currentPrice = tradeData.price;
 
     for (const openTrade of openTradesList) {
       let pnl = calcUnrealizedPnL(openTrade, currentPrice);
@@ -1295,7 +1312,14 @@ async function runScanMode() {
   }
 
   // ── Signal Scan (Reached ONLY when 0 contracts exist on broker and locally) ──
-  const scanData = await fetchAllData();
+  let scanData;
+  try {
+    scanData = await fetchAllData();
+  } catch (fetchErr) {
+    console.warn(`[${REPO_LABEL}] Failed to fetch market candles: ${fetchErr.message}. Skipping scan this cycle.`);
+    return;
+  }
+
   const candles = scanData.m5;
   const h1Candles = scanData.h1;
   const d1Candles = scanData.d1;
