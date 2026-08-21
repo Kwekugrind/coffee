@@ -189,7 +189,8 @@ let state = {
   waitingFor: null, setupEpoch: null, lastProcessedEpoch: null, lastTgUpdateId: 0, h1TrendEpoch: null, 
   phaseATriggeredEpoch: null, activeEntryType: null, phaseATaken: false, h1TrendCycleEpoch: null,
   phaseADeadlineEpoch: null, phaseAWindowExpired: false,
-  phaseBPending: null, phaseBStochFreshSeen: false, phaseBCciFreshSeen: false, phaseBTdiFreshSeen: false
+  phaseBPending: null,
+  phaseBStochFreshSeen: false, phaseBCciFreshSeen: false, phaseBTdiFreshSeen: false
 };
 try {
   const s = JSON.parse(fs.readFileSync("state.json"));
@@ -315,7 +316,7 @@ async function getDerivOTP(accountId) {
   return json.data.url;
 }
 
-// ── Authenticated Server Contract Status ──
+// ── Authenticated Server Contract Status (Fresh OTP per request) ──
 async function getServerContractStatus(contractId, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -355,7 +356,7 @@ async function getServerContractStatus(contractId, preAccountId = null) {
   }, 3, 3000);
 }
 
-// ── Authenticated Portfolio Fetcher ──
+// ── Authenticated Portfolio Fetcher (Fresh OTP per request) ──
 async function getOpenPortfolio(preAccountId = null) {
   if (!DERIV_TOKEN || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -379,7 +380,7 @@ async function getOpenPortfolio(preAccountId = null) {
   }, 3, 3000);
 }
 
-// ── Authenticated Profit Table Lookup ──
+// ── Authenticated Profit Table Lookup (Fresh OTP per request) ──
 async function getContractProfitFromHistory(contractId, approxOpenEpoch, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return null;
   return withRetry(async () => {
@@ -417,7 +418,7 @@ async function getContractProfitFromHistory(contractId, approxOpenEpoch, preAcco
   }, 3, 3000);
 }
 
-// ── Authenticated Broker-Side Stop Loss Update ──
+// ── Authenticated Broker-Side Stop Loss Update (Precision Check) ──
 async function updateContractStopLoss(contractId, slAmount, preAccountId = null) {
   if (!DERIV_TOKEN || !contractId || !PROXY_URL || !PROXY_SECRET || !DERIV_APP_ID) return false;
   return withRetry(async () => {
@@ -822,7 +823,6 @@ function calculateBgaTakeProfits(entry, direction, slDistance, d1Candles) {
     }
   }
 
-  // Generate grid levels around the entry
   const allLevels = [];
   for (let offset = -20 * step; offset <= 25 * step; offset += halfStep) {
     allLevels.push(baseWhole + offset);
@@ -1012,7 +1012,7 @@ async function runScanMode() {
 
   await checkTelegramCommands();
 
-  // ── Open Position Management ──
+  // ── Open Position Management (STRICT 1-TRADE GATE) ──
   const openTradesList = trades.filter(t => !t.result && !t.pending);
   if (openTradesList.length > 0) {
     let tradeData;
@@ -1177,7 +1177,7 @@ async function runScanMode() {
         const tp1Status = openTrade.tp1Reached ? "✅ TP1 hit" : "❌ TP1 not reached";
         const pnlStr = serverPnl >= 0 ? `+$${serverPnl.toFixed(2)}` : `-$${Math.abs(serverPnl).toFixed(2)}`;
 
-        await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${finalResult}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${openTrade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
+        await sendTelegram(`${icon} *${REPO_LABEL} — Trade ${finalResult}*\n\nDirection: ${openTrade.direction} (${contractType})\nSymbol: ${SYMBOL_NAME}\n\n📍 Entry: ${openTrade.entry.toFixed(4)}\n🏁 Exit: ${currentPrice.toFixed(4)}\n🛑 SL: ${trade.sl.toFixed(4)} ($${slDollars} hard)\n🎯 TP1: ${openTrade.tp1.toFixed(4)} (BGA) ${tp1Status}\n\n💵 P&L: ${pnlStr} (Net of comm.)\nReason: ${exitReason}\nDuration: ${formatDuration(durationMs)}\n\nOpened: ${openTrade.openTime}\nClosed: ${openTrade.closeTime}\n` + (openTrade.contractId ? `Contract: \`${openTrade.contractId}\`` : ""));
       };
 
       // ── 1. Priority Exit Checks ──
@@ -1273,7 +1273,7 @@ async function runScanMode() {
     }
 
     console.log(`[${REPO_LABEL}] Finished managing ${openTradesList.length} open position(s) — skipping signal scan.`);
-    return;
+    return; // <── EXITS IMMEDIATELY: STOPS ANY NEW SIGNALS WHILE POSITION RUNS
   }
 
   // ── STRICT PRE-SCAN GUARD: If ANY live contract exists on Deriv or locally, skip scan ──
@@ -1413,7 +1413,7 @@ async function runScanMode() {
   if (si >= 1 && stoch.k[si] != null && stoch.d[si] != null && stoch.k[si-1] != null && stoch.d[si-1] != null &&
       cci[si] != null && cci[si-1] != null && rsi[si] != null && rsi[si-1] != null && tdi.middle[si] != null && tdi.middle[si-1] != null) {
 
-    // --- PHASE A ---
+    // --- PHASE A: Must take the very first trade within PHASE_A_WINDOW_SECONDS ---
     if (!state.phaseATaken && !state.phaseAWindowExpired) {
       const deadlinePassed = state.phaseADeadlineEpoch && currentCandleEpoch > state.phaseADeadlineEpoch;
 
@@ -1447,7 +1447,7 @@ async function runScanMode() {
       }
     }
 
-    // --- PHASE B ---
+    // --- PHASE B: Stateful Pullback Re-entry Engine (Pure Price Action & Crossovers) ---
     if (!signalTriggered && (state.phaseATaken || state.phaseAWindowExpired)) {
       const stochCrossBuyB = (stoch.k[si-1] <= 50) && (stoch.k[si] > 50);
       const stochCrossSellB = (stoch.k[si-1] >= 50) && (stoch.k[si] < 50);
@@ -1459,10 +1459,12 @@ async function runScanMode() {
       const tdiCrossSellB = rsi[si-1] >= tdi.middle[si-1] && rsi[si] < tdi.middle[si];
 
       if (state.waitingFor === "BUY") {
+        // De-alignment reset checks
         if (stoch.k[si] < 50) state.phaseBStochFreshSeen = false;
         if (cci[si] < 0) state.phaseBCciFreshSeen = false;
         if (rsi[si] < tdi.middle[si]) state.phaseBTdiFreshSeen = false;
 
+        // Arm Phase B upon first fresh cross from pullback
         if (!state.phaseBPending) {
           if (stochCrossBuyB || cciCrossBuyB || tdiCrossBuyB) {
             state.phaseBPending = "BUY";
@@ -1493,10 +1495,12 @@ async function runScanMode() {
         }
 
       } else if (state.waitingFor === "SELL") {
+        // De-alignment reset checks
         if (stoch.k[si] > 50) state.phaseBStochFreshSeen = false;
         if (cci[si] > 0) state.phaseBCciFreshSeen = false;
         if (rsi[si] > tdi.middle[si]) state.phaseBTdiFreshSeen = false;
 
+        // Arm Phase B upon first fresh cross from pullback
         if (!state.phaseBPending) {
           if (stochCrossSellB || cciCrossSellB || tdiCrossSellB) {
             state.phaseBPending = "SELL";
@@ -1530,7 +1534,7 @@ async function runScanMode() {
   }
 
   if (signalTriggered) {
-    // ── Pre-Execution Portfolio Check with Strict Abort ──
+    // ── Pre-Execution Portfolio Check with Strict Abort (WALL 3) ──
     console.log(`[${REPO_LABEL}] Signal triggered for ${direction}. Performing immediate pre-execution portfolio check...`);
     try {
       const preCheckPortfolio = await getOpenPortfolio(cachedAccountId);
