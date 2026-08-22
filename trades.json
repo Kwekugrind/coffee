@@ -188,7 +188,7 @@
     "symbol": "1HZ75V",
     "direction": "SELL",
     "entry": 6792.4,
-    "sl": 6809.95281586992,
+    "sl": 6736.57,
     "tp1": 6700,
     "tp2": 6550,
     "tp3": 6500,
@@ -201,7 +201,8 @@
     "psarAligned": true,
     "brokerSlAmount": 5,
     "openTime": "2026-08-22 02:45:00",
-    "closeTime": null,
-    "result": null
+    "closeTime": "2026-08-22 04:22:41",
+    "result": "LOSS",
+    "resultSource": "estimated_fallback"
   }
 ]
