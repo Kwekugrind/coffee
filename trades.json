@@ -250,7 +250,8 @@
     "entryType": "PHASE_B_NO_PRIOR_A",
     "brokerSlAmount": 5,
     "openTime": "2026-08-22 15:00:00",
-    "closeTime": null,
-    "result": null
+    "closeTime": "2026-08-22 17:57:42",
+    "result": "WIN",
+    "resultSource": "estimated_fallback"
   }
 ]
